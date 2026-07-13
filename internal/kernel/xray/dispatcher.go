@@ -75,6 +75,7 @@ type LimitDispatcher struct {
 	limitedIPs   map[string]map[string]int // email → sourceIP → refcount
 	deviceLimits map[string]int            // email → max devices
 	emailToUID   map[string]int            // email → panel user ID
+	audit        *auditLogger
 
 	// unlimitedIPs: users without device limit — sync.Map for lock-free access.
 	// Each entry is *ipCounter{ips sync.Map}.
@@ -118,6 +119,9 @@ func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*
 
 	if email != "" {
 		d.trackLink(link, email, sourceIP, isTCP)
+		if audit := d.auditLog(); audit != nil {
+			audit.LogAccepted(email, sourceIP, dest)
+		}
 	}
 	return link, nil
 }
@@ -131,7 +135,15 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 	if email != "" {
 		d.trackLink(link, email, sourceIP, isTCP)
 	}
-	return d.innerDisp.DispatchLink(ctx, dest, link)
+	if err := d.innerDisp.DispatchLink(ctx, dest, link); err != nil {
+		return err
+	}
+	if email != "" {
+		if audit := d.auditLog(); audit != nil {
+			audit.LogAccepted(email, sourceIP, dest)
+		}
+	}
+	return nil
 }
 
 // identifyAndCheck extracts user identity from the session context, enforces
@@ -198,6 +210,19 @@ func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, 
 	d.deviceLimits = deviceLimits
 	d.mu.Unlock()
 
+}
+
+func (d *LimitDispatcher) SetAuditLogger(a *auditLogger) {
+	d.mu.Lock()
+	d.audit = a
+	d.mu.Unlock()
+}
+
+func (d *LimitDispatcher) auditLog() *auditLogger {
+	d.mu.RLock()
+	a := d.audit
+	d.mu.RUnlock()
+	return a
 }
 
 func (d *LimitDispatcher) ResetConns() {
