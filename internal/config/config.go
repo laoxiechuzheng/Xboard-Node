@@ -121,6 +121,8 @@ type KernelConfig struct {
 	Type      string `yaml:"type"` // "singbox" or "xray"
 	ConfigDir string `yaml:"config_dir"`
 	LogLevel  string `yaml:"log_level"`
+	AuditLog  string `yaml:"audit_log"`
+	ForceProxyProtocol bool `yaml:"force_proxy_protocol"`
 
 	// GeoDataDir is the directory that contains GeoIP/GeoSite database files.
 	// For sing-box: geoip.db and geosite.db (geoip2-format).
@@ -500,6 +502,12 @@ func (c *Config) inheritFrom(parent *Config) {
 	}
 	if c.Kernel.LogLevel == "" {
 		c.Kernel.LogLevel = parent.Kernel.LogLevel
+	}
+	if c.Kernel.AuditLog == "" {
+		c.Kernel.AuditLog = parent.Kernel.AuditLog
+	}
+	if !c.Kernel.ForceProxyProtocol && parent.Kernel.ForceProxyProtocol {
+		c.Kernel.ForceProxyProtocol = parent.Kernel.ForceProxyProtocol
 	}
 	if c.Kernel.GeoDataDir == "" {
 		c.Kernel.GeoDataDir = parent.Kernel.GeoDataDir
