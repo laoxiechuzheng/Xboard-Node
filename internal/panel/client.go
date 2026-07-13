@@ -246,6 +246,9 @@ func (c *Client) GetConfig() (*NodeConfig, error) {
 	if cfg.Protocol == "" {
 		return nil, fmt.Errorf("invalid config: missing protocol")
 	}
+	if cfg.NodeID == 0 {
+		cfg.NodeID = c.nodeID
+	}
 
 	if etag := resp.Header.Get("ETag"); etag != "" {
 		c.configETag = etag
