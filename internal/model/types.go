@@ -3,6 +3,7 @@ package model
 import "github.com/cedar2025/xboard-node/internal/config"
 
 type NodeSpec struct {
+	NodeID          int
 	Protocol        string
 	ListenIP        string
 	ServerPort      int
