@@ -68,6 +68,7 @@ type Xray struct {
 	lastKernelHash  string
 	cumTraffic      map[int][2]int64
 	speedLimitFunc  func(string) *rate.Limiter
+	audit           *auditLogger
 
 	// running is set after a successful Start and cleared before shutdown.
 	// Atomic so IsRunning / GetConnections never block.
@@ -78,6 +79,7 @@ func New(cfg config.KernelConfig) *Xray {
 	return &Xray{
 		cfg:        cfg,
 		cumTraffic: make(map[int][2]int64),
+		audit:      newAuditLogger(cfg.AuditLog),
 	}
 }
 
@@ -158,6 +160,13 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	x.lastKernelHash = kernel.ComputeHash(nodeConfig, users)
 	x.running.Store(true)
 	x.mu.Unlock()
+
+	if ld != nil {
+		ld.SetAuditLogger(x.audit)
+	}
+	if x.audit != nil {
+		x.audit.UpdateContext(nodeConfig, users)
+	}
 
 	// ── Phase 5: Recycle old (background, non-blocking) ─────────────────
 	closeOld(old, oldLD)
@@ -782,8 +791,12 @@ func (x *Xray) updateBandwidthLimits(users []model.UserSpec) {
 func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 	x.mu.Lock()
 	ld := x.limitDispatcher
+	nc := x.nodeConfig
 	x.mu.Unlock()
 	if ld == nil {
+		if x.audit != nil {
+			x.audit.UpdateContext(nc, users)
+		}
 		return
 	}
 
@@ -801,6 +814,10 @@ func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 	}
 
 	ld.UpdateLimits(emailToUID, deviceLimits, nil)
+	ld.SetAuditLogger(x.audit)
+	if x.audit != nil {
+		x.audit.UpdateContext(nc, users)
+	}
 }
 
 // xrayCreationMu serialises xrayCore.New() + globalLimitDispatcher capture
