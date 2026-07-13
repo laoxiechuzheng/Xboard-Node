@@ -87,6 +87,7 @@ func NodeSpecFromPanel(nc *panel.NodeConfig) *NodeSpec {
 	}
 
 	return &NodeSpec{
+		NodeID:              nc.NodeID,
 		Protocol:            nc.Protocol,
 		ListenIP:            nc.ListenIP,
 		ServerPort:          nc.ServerPort,
@@ -127,6 +128,9 @@ func NodeSpecFromPanel(nc *panel.NodeConfig) *NodeSpec {
 
 func NodeSpecFromPanelValidated(nc *panel.NodeConfig, kcfg config.KernelConfig) (*NodeSpec, error) {
 	spec := NodeSpecFromPanel(nc)
+	if spec != nil && kcfg.ForceProxyProtocol {
+		spec.AcceptProxyProtocol = true
+	}
 	if err := ValidateNodeSpec(spec, kcfg); err != nil {
 		return nil, err
 	}
@@ -226,6 +230,7 @@ func (n *NodeSpec) ToPanel() *panel.NodeConfig {
 	}
 
 	return &panel.NodeConfig{
+		NodeID:              n.NodeID,
 		Protocol:            n.Protocol,
 		ListenIP:            n.ListenIP,
 		ServerPort:          n.ServerPort,
