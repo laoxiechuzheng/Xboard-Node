@@ -12,10 +12,10 @@ import (
 )
 
 const (
-	singboxGeoIPURL   = "https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db"
-	singboxGeoSiteURL = "https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite.db"
-	xrayGeoIPURL      = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
-	xrayGeoSiteURL    = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+	singboxGeoIPURL   = "https://github.com/laoxiechuzheng/sing-geoip/releases/latest/download/geoip.db"
+	singboxGeoSiteURL = "https://github.com/laoxiechuzheng/sing-geosite/releases/latest/download/geosite.db"
+	xrayGeoIPURL      = "https://github.com/laoxiechuzheng/v2ray-rules-dat/releases/latest/download/geoip.dat"
+	xrayGeoSiteURL    = "https://github.com/laoxiechuzheng/v2ray-rules-dat/releases/latest/download/geosite.dat"
 )
 
 var httpClient = &http.Client{Timeout: 10 * time.Minute}
