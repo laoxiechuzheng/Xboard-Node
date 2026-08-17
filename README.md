@@ -59,6 +59,17 @@ xbctl service restart
 
 Legacy single-panel config is fully compatible. Appending bindings auto-migrates to `instances` format. See `config.yml.example`.
 
+Set either logger's existing level to `none` to disable it:
+
+```yaml
+log:
+  level: "none"
+kernel:
+  log_level: "none"
+```
+
+`log.level: none` disables xboard-node application logs without creating `log.output`. `kernel.log_level: none` disables xray/sing-box core logs and prevents the xray audit log from being opened. Startup failures before the configuration is loaded and Go runtime panics may still be written directly to stderr.
+
 ## Extensions
 
 - Custom routes: [docs-custom-routes.md](docs-custom-routes.md)

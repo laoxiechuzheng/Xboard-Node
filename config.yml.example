@@ -10,8 +10,9 @@
 # ── Multiple instances ──
 # kernel:
 #   type: "singbox"
+#   log_level: "none"  # disable embedded sing-box/xray logs and xray audit logging
 # log:
-#   level: "info"
+#   level: "none"      # disable xboard-node application logs
 # instances:
 #   - panel:
 #       url: "https://panel.example.com"

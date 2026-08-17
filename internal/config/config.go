@@ -819,6 +819,12 @@ func (c *Config) ExpandMachineNode(nodeID int, nodeType string) *Config {
 }
 
 func InitLogger(cfg LogConfig) {
+	if IsLogLevelDisabled(cfg.Level) {
+		nlog.Init(io.Discard, slog.LevelError+1, false)
+		slog.SetDefault(slog.New(slog.DiscardHandler))
+		return
+	}
+
 	var minLevel slog.Level
 	switch cfg.Level {
 	case "debug":
@@ -862,6 +868,10 @@ func InitLogger(cfg LogConfig) {
 	nlog.Init(w, minLevel, useColor)
 	// Application logging goes through nlog; silence slog.Default for stray library use.
 	slog.SetDefault(slog.New(slog.DiscardHandler))
+}
+
+func IsLogLevelDisabled(level string) bool {
+	return strings.EqualFold(strings.TrimSpace(level), "none")
 }
 
 // ValidateStartupLayout checks that multiple instances do not conflict on

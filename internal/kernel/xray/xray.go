@@ -76,10 +76,14 @@ type Xray struct {
 }
 
 func New(cfg config.KernelConfig) *Xray {
+	var audit *auditLogger
+	if !config.IsLogLevelDisabled(cfg.LogLevel) {
+		audit = newAuditLogger(cfg.AuditLog)
+	}
 	return &Xray{
 		cfg:        cfg,
 		cumTraffic: make(map[int][2]int64),
-		audit:      newAuditLogger(cfg.AuditLog),
+		audit:      audit,
 	}
 }
 

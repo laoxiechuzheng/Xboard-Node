@@ -45,11 +45,16 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 		outbounds = append(outbounds, M{"type": "block", "tag": "block"})
 	}
 
+	logConfig := M{
+		"level":     kcfg.LogLevel,
+		"timestamp": true,
+	}
+	if config.IsLogLevelDisabled(kcfg.LogLevel) {
+		logConfig = M{"disabled": true}
+	}
+
 	cfg := M{
-		"log": M{
-			"level":     kcfg.LogLevel,
-			"timestamp": true,
-		},
+		"log": logConfig,
 		"outbounds": outbounds,
 	}
 

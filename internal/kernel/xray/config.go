@@ -44,11 +44,17 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 		outbounds = append(outbounds, M{"protocol": "blackhole", "tag": "block"})
 	}
 
+	logLevel := xrayLogLevel(kcfg.LogLevel)
+	errorLog, accessLog := "", ""
+	if logLevel == "none" {
+		errorLog, accessLog = "none", "none"
+	}
+
 	cfg := M{
 		"log": M{
-			"loglevel": xrayLogLevel(kcfg.LogLevel),
-			"error":    "",
-			"access":   "",
+			"loglevel": logLevel,
+			"error":    errorLog,
+			"access":   accessLog,
 		},
 		"stats": M{},
 		"policy": M{
@@ -181,6 +187,9 @@ func mergeCustomXrayRouting(cfg M, customRouting map[string]any) {
 }
 
 func xrayLogLevel(singboxLevel string) string {
+	if config.IsLogLevelDisabled(singboxLevel) {
+		return "none"
+	}
 	switch singboxLevel {
 	case "trace", "debug":
 		return "debug"

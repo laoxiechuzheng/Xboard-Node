@@ -323,7 +323,9 @@ func (s *Service) applyRemoteOverrides(ctx context.Context, nc *model.NodeSpec) 
 	}
 
 	// Dynamic Log Level (Kernel)
-	if nc.KernelLogLevel != "" && nc.KernelLogLevel != s.cfg.Kernel.LogLevel {
+	if nc.KernelLogLevel != "" &&
+		!config.IsLogLevelDisabled(s.cfg.Kernel.LogLevel) &&
+		nc.KernelLogLevel != s.cfg.Kernel.LogLevel {
 		nlog.Core().Info("cert: kernel log level override", "old", s.cfg.Kernel.LogLevel, "new", nc.KernelLogLevel)
 		s.cfg.Kernel.LogLevel = nc.KernelLogLevel
 	}
