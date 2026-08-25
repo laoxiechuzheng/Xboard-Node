@@ -112,6 +112,7 @@ type NodeConfig struct {
 type WSConfig struct {
 	StatusInterval    int `yaml:"status_interval"`    // node.status interval (sec), default 10
 	HandshakeTimeout  int `yaml:"handshake_timeout"`  // WS handshake timeout (sec), default 15
+	ReadTimeout       int `yaml:"read_timeout"`       // WS read idle timeout (sec), default 150
 	BackoffInitial    int `yaml:"backoff_initial"`    // initial reconnect delay (sec), default 1
 	BackoffMax        int `yaml:"backoff_max"`        // max reconnect delay (sec), default 60
 	DiscoveryInterval int `yaml:"discovery_interval"` // WS discovery interval (sec), default 300
@@ -517,6 +518,9 @@ func (c *Config) inheritFrom(parent *Config) {
 	if c.WS.HandshakeTimeout == 0 {
 		c.WS.HandshakeTimeout = parent.WS.HandshakeTimeout
 	}
+	if c.WS.ReadTimeout == 0 {
+		c.WS.ReadTimeout = parent.WS.ReadTimeout
+	}
 	if c.WS.BackoffInitial == 0 {
 		c.WS.BackoffInitial = parent.WS.BackoffInitial
 	}
@@ -644,6 +648,9 @@ func (c *Config) setDefaultsFrom(baseDir string) {
 	}
 	if c.WS.HandshakeTimeout == 0 {
 		c.WS.HandshakeTimeout = 15
+	}
+	if c.WS.ReadTimeout == 0 {
+		c.WS.ReadTimeout = 150
 	}
 	if c.WS.BackoffInitial == 0 {
 		c.WS.BackoffInitial = 1

@@ -4,13 +4,17 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/cedar2025/xboard-node/internal/cert"
 	"github.com/cedar2025/xboard-node/internal/config"
+	"github.com/cedar2025/xboard-node/internal/controlplane"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/limiter"
 	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/cedar2025/xboard-node/internal/tracker"
 	"golang.org/x/time/rate"
 )
 
@@ -34,8 +38,8 @@ type fakeKernel struct {
 	deviceLimitFunc func(string) (int, bool)
 }
 
-func (f *fakeKernel) Name() string { return "fake" }
-func (f *fakeKernel) Protocols() []string { return []string{"vless"} }
+func (f *fakeKernel) Name() string                      { return "fake" }
+func (f *fakeKernel) Protocols() []string               { return []string{"vless"} }
 func (f *fakeKernel) Capabilities() kernel.Capabilities { return kernel.Capabilities{} }
 func (f *fakeKernel) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	_, _, _ = nodeConfig, users, tls
@@ -46,7 +50,7 @@ func (f *fakeKernel) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, t
 	f.running = true
 	return nil
 }
-func (f *fakeKernel) Stop() { f.running = false }
+func (f *fakeKernel) Stop()           { f.running = false }
 func (f *fakeKernel) IsRunning() bool { return f.running }
 func (f *fakeKernel) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	_, _, _ = nodeConfig, users, tls
@@ -92,9 +96,9 @@ func (f *fakeKernel) CloseUserConnections(ctx context.Context, uuid string) erro
 	return nil
 }
 func (f *fakeKernel) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) { f.speedLimitFunc = fn }
-func (f *fakeKernel) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) { f.deviceLimitFunc = fn }
-func (f *fakeKernel) UpdateGlobalDevices(users map[int][]string) { _ = users }
-func (f *fakeKernel) ClearGlobalDevices() {}
+func (f *fakeKernel) SetDeviceLimitFunc(fn func(uuid string) (int, bool))  { f.deviceLimitFunc = fn }
+func (f *fakeKernel) UpdateGlobalDevices(users map[int][]string)           { _ = users }
+func (f *fakeKernel) ClearGlobalDevices()                                  {}
 
 func newTestService(k *fakeKernel) *Service {
 	sharedLimiter := limiter.New()
@@ -197,7 +201,6 @@ func TestApplyUserDeltaAddPreparesLimiterBeforeKernelUpdate(t *testing.T) {
 		t.Fatal("expected limiter for delta-added user after successful update")
 	}
 }
-
 
 func TestValidateNodeRuntimeRejectsUnsupportedDNSProvider(t *testing.T) {
 	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox"}}
@@ -322,5 +325,139 @@ func TestWireKernelCallbacksDeviceLimitEnforcement(t *testing.T) {
 	s.wireKernelCallbacks()
 	if k.deviceLimitFunc == nil {
 		t.Fatal("device limit callback should be registered when enforcement is enabled")
+	}
+}
+
+type fakePushClient struct {
+	mu        sync.Mutex
+	connected bool
+	reports   []map[int][]string
+}
+
+func (f *fakePushClient) Run(ctx context.Context) { _ = ctx }
+func (f *fakePushClient) IsConnected() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.connected
+}
+func (f *fakePushClient) SendDeviceReport(devices map[int][]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reports = append(f.reports, devices)
+}
+
+type fakeSink struct {
+	mu      sync.Mutex
+	reports []map[int][]string
+}
+
+func (f *fakeSink) Report(payload controlplane.ReportPayload) error { return nil }
+func (f *fakeSink) ReportDevices(push controlplane.PushClient, devices map[int][]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reports = append(f.reports, devices)
+}
+func (f *fakeSink) SupportsReporting() bool     { return true }
+func (f *fakeSink) SupportsDeviceReports() bool { return true }
+
+type noopSource struct{}
+
+func (noopSource) Initial(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- controlplane.Event, statuses chan<- controlplane.StatusChange) (controlplane.Bootstrap, error) {
+	return controlplane.Bootstrap{}, nil
+}
+func (noopSource) Poll(ctx context.Context) (controlplane.Snapshot, error) {
+	return controlplane.Snapshot{}, nil
+}
+func (noopSource) Discover(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- controlplane.Event, statuses chan<- controlplane.StatusChange) (controlplane.PushClient, error) {
+	return nil, nil
+}
+func (noopSource) Metrics() controlplane.APIMetrics { return controlplane.APIMetrics{} }
+func (noopSource) SupportsPolling() bool            { return false }
+func (noopSource) SupportsDiscovery() bool          { return false }
+
+func TestSendDeviceReportForceReportsUnchangedSnapshot(t *testing.T) {
+	tr := tracker.New()
+	tr.Process(nil, map[int]map[string]bool{1: {"10.0.0.1": true}}, 0)
+
+	if got := tr.FlushAliveIPs(); got == nil {
+		t.Fatal("expected first flush to return alive IPs")
+	}
+	if got := tr.FlushAliveIPs(); got != nil {
+		t.Fatal("expected duplicate flush to return nil")
+	}
+
+	push := &fakePushClient{connected: true}
+	sink := &fakeSink{}
+	s := &Service{tracker: tr, sink: sink, wsClient: push}
+
+	s.sendDeviceReportForce(context.Background())
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if len(sink.reports) != 1 {
+		t.Fatalf("expected 1 forced device report, got %d", len(sink.reports))
+	}
+	if len(sink.reports[0][1]) != 1 || sink.reports[0][1][0] != "10.0.0.1" {
+		t.Fatalf("unexpected forced report: %v", sink.reports[0])
+	}
+}
+
+func TestSendDeviceBatchForcesReportOnReconnectTransition(t *testing.T) {
+	tr := tracker.New()
+	tr.Process(nil, map[int]map[string]bool{3: {"10.0.0.3": true}}, 0)
+	if got := tr.FlushAliveIPs(); got == nil {
+		t.Fatal("expected first flush to return alive IPs")
+	}
+
+	push := &fakePushClient{connected: true}
+	sink := &fakeSink{}
+	s := &Service{tracker: tr, sink: sink, wsClient: push}
+
+	// First tick after (re)connect: report even though the snapshot is unchanged.
+	s.sendDeviceBatch()
+	if n := len(sink.reports); n != 1 {
+		t.Fatalf("expected 1 report after reconnect transition, got %d", n)
+	}
+
+	// Still connected and unchanged: deduped.
+	s.sendDeviceBatch()
+	if n := len(sink.reports); n != 1 {
+		t.Fatalf("expected no extra report while unchanged, got %d", n)
+	}
+
+	// Simulate a disconnect/reconnect cycle: the next tick must force a report.
+	s.lastWSConnected.Store(false)
+	s.sendDeviceBatch()
+	if n := len(sink.reports); n != 2 {
+		t.Fatalf("expected 1 report after disconnect/reconnect cycle, got %d", n)
+	}
+}
+
+func TestHandleWSStatusConnectedSchedulesDeviceReport(t *testing.T) {
+	tr := tracker.New()
+	tr.Process(nil, map[int]map[string]bool{2: {"10.0.0.2": true}}, 0)
+	if got := tr.FlushAliveIPs(); got == nil {
+		t.Fatal("expected first flush to return alive IPs")
+	}
+
+	push := &fakePushClient{connected: true}
+	sink := &fakeSink{}
+	s := &Service{tracker: tr, sink: sink, wsClient: push, source: noopSource{}}
+
+	s.handleWSStatus(context.Background(), controlplane.StatusChange{Connected: true})
+
+	deadline := time.After(6 * time.Second) // wsPullJitter can delay up to 5s
+	for {
+		sink.mu.Lock()
+		n := len(sink.reports)
+		sink.mu.Unlock()
+		if n >= 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for device report after WS reconnect")
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 }

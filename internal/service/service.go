@@ -66,12 +66,16 @@ type Service struct {
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
 
-	wsClient         controlplane.PushClient        // Push client (nil if push is not enabled)
-	wsEvents         chan controlplane.Event        // receives data events from push transport
-	wsStatusCh       chan controlplane.StatusChange // receives push connectivity notifications
-	wsCancel         context.CancelFunc             // cancels the WS client goroutine
-	wsDisconnectAt   time.Time                      // when WS last disconnected (zero if connected)
-	wsResyncPending  atomic.Bool
+	wsClient        controlplane.PushClient        // Push client (nil if push is not enabled)
+	wsEvents        chan controlplane.Event        // receives data events from push transport
+	wsStatusCh      chan controlplane.StatusChange // receives push connectivity notifications
+	wsCancel        context.CancelFunc             // cancels the WS client goroutine
+	wsDisconnectAt  time.Time                      // when WS last disconnected (zero if connected)
+	wsResyncPending atomic.Bool
+	// lastWSConnected tracks the connection state observed by the device
+	// report ticker. It is used as a fallback to force a device snapshot on a
+	// reconnect even if a WS status notification was dropped.
+	lastWSConnected  atomic.Bool
 	machineMailbox   *controlplane.NodeMailbox
 	machineMailboxCh <-chan struct{}
 
@@ -163,8 +167,8 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 		limiter:      l,
 		speedTracker: st,
 		cert:         certMgr,
-		wsEvents:     make(chan controlplane.Event, 16),
-		wsStatusCh:   make(chan controlplane.StatusChange, 4),
+		wsEvents:     make(chan controlplane.Event, 64),
+		wsStatusCh:   make(chan controlplane.StatusChange, 16),
 		pullResults:  make(chan pullResult, 1),
 	}
 }
@@ -464,6 +468,26 @@ func (s *Service) schedulePullAsync(ctx context.Context, maxJitter time.Duration
 	}()
 }
 
+// scheduleDeviceReportAsync runs a forced device report after a random delay
+// in [0, maxJitter]. Jitter spreads reconnect reports across nodes so a
+// machine-wide WS reconnect does not stampede the panel.
+func (s *Service) scheduleDeviceReportAsync(ctx context.Context, maxJitter time.Duration) {
+	delay := time.Duration(0)
+	if maxJitter > 0 {
+		delay = time.Duration(rand.Int64N(int64(maxJitter) + 1))
+	}
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			return
+		}
+		s.sendDeviceReportForce(ctx)
+	}()
+}
+
 func (s *Service) wsMetrics() map[string]interface{} {
 	status := monitor.Collect()
 	m := s.buildMetrics(status)
@@ -492,12 +516,18 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 		// After reconnect, proactively pull once to ensure we haven't missed
 		// any updates during the disconnection window.
 		s.schedulePullAsync(ctx, wsPullJitter)
+		// The panel clears node devices on disconnect and only restores them
+		// when the node reports again. Force a full device snapshot now so the
+		// global online-device count recovers immediately instead of waiting
+		// for the next online/offline transition.
+		s.scheduleDeviceReportAsync(ctx, wsPullJitter)
 	} else {
 		s.metricsMu.Lock()
 		if s.wsDisconnectAt.IsZero() {
 			s.wsDisconnectAt = time.Now()
 		}
 		s.metricsMu.Unlock()
+		s.lastWSConnected.Store(false)
 		if s.nodeLog != nil {
 			s.nodeLog.Info("ws disconnected")
 		} else {
@@ -1164,23 +1194,49 @@ func computeUserHash(users []model.UserSpec) string {
 
 // sendDeviceBatch reports local device snapshot to panel via WS.
 func (s *Service) sendDeviceBatch() {
-	if s.wsClient == nil || !s.wsClient.IsConnected() {
+	s.metricsMu.RLock()
+	wsClient := s.wsClient
+	s.metricsMu.RUnlock()
+	if wsClient == nil || !wsClient.IsConnected() {
+		s.lastWSConnected.Store(false)
 		return
 	}
 
+	wasConnected := s.lastWSConnected.Swap(true)
 	devices := s.tracker.FlushAliveIPs()
 	// FlushAliveIPs returns nil if no changes since last flush
 	if devices == nil {
-		nlog.Core().Debug("device snapshot unchanged, skipping")
-		return
+		if wasConnected {
+			nlog.Core().Debug("device snapshot unchanged, skipping")
+			return
+		}
+		// The connection just came back: the panel cleared our devices on
+		// disconnect, so send the current snapshot even though it is unchanged.
+		devices = s.tracker.SnapshotAliveIPs()
 	}
-	s.sink.ReportDevices(s.wsClient, devices)
+	s.sink.ReportDevices(wsClient, devices)
 	nlog.Core().Debug("device snapshot sent", "users", len(devices))
 }
 
 // reportDevices periodically reports device snapshot to panel.
 func (s *Service) reportDevices() {
 	s.sendDeviceBatch()
+}
+
+// sendDeviceReportForce reports the current device snapshot unconditionally,
+// bypassing change detection. It is used after a WS reconnect because the
+// panel clears node devices while the connection is down and only restores
+// them after the node reports again.
+func (s *Service) sendDeviceReportForce(ctx context.Context) {
+	_ = ctx
+	s.metricsMu.RLock()
+	wsClient := s.wsClient
+	s.metricsMu.RUnlock()
+	if wsClient == nil || !wsClient.IsConnected() {
+		return
+	}
+	devices := s.tracker.SnapshotAliveIPs()
+	s.sink.ReportDevices(wsClient, devices)
 }
 
 // ─── Runtime validation ─────────────────────────────────────────────────

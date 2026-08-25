@@ -198,6 +198,24 @@ func (t *Tracker) FlushAliveIPs() map[int][]string {
 	return t.aliveIPsBuf
 }
 
+// SnapshotAliveIPs returns a fresh copy of the current per-user alive IPs,
+// regardless of whether they changed since the last flush. Unlike
+// FlushAliveIPs it never updates the dedup hash, so it can be used to force a
+// full report after WS reconnect (the panel clears node devices on disconnect
+// and needs a new snapshot even when the local set is unchanged).
+func (t *Tracker) SnapshotAliveIPs() map[int][]string {
+	s := t.live.Load()
+	out := make(map[int][]string, len(s.aliveIPs))
+	for uid, ips := range s.aliveIPs {
+		list := make([]string, 0, len(ips))
+		for ip := range ips {
+			list = append(list, ip)
+		}
+		out[uid] = list
+	}
+	return out
+}
+
 // calcAliveIPsHash computes a deterministic hash for change detection.
 func calcAliveIPsHash(aliveIPs map[int]map[string]bool) string {
 	if len(aliveIPs) == 0 {

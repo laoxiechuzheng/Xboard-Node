@@ -4,7 +4,6 @@ package machine
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -283,6 +282,7 @@ func (o *Orchestrator) tryStartWS(ctx context.Context) {
 	wsCfg := panel.WSClientConfig{
 		StatusInterval:   time.Duration(o.cfg.WS.StatusInterval) * time.Second,
 		HandshakeTimeout: time.Duration(o.cfg.WS.HandshakeTimeout) * time.Second,
+		ReadTimeout:      time.Duration(o.cfg.WS.ReadTimeout) * time.Second,
 		BackoffInitial:   time.Duration(o.cfg.WS.BackoffInitial) * time.Second,
 		BackoffMax:       time.Duration(o.cfg.WS.BackoffMax) * time.Second,
 		MachineID:        o.cfg.Machine.MachineID,
@@ -347,6 +347,7 @@ func (o *Orchestrator) onWSStatus(status panel.WSStatusChange) {
 		select {
 		case ch <- change:
 		default:
+			nlog.Core().Debug("machine ws status channel full, dropping status change", "connected", status.Connected)
 		}
 	}
 }
@@ -399,15 +400,7 @@ func (p *machineNodePush) SendDeviceReport(devices map[int][]string) {
 	if p.ws == nil {
 		return
 	}
-	payload := map[string]interface{}{
-		"node_id": p.nodeID,
-	}
-	// Flatten into the standard format with node_id wrapper.
-	strDevices := make(map[string][]string, len(devices))
-	for uid, ips := range devices {
-		strDevices[fmt.Sprintf("%d", uid)] = ips
-	}
-	payload["devices"] = strDevices
-	data, _ := json.Marshal(payload)
-	p.ws.SendRaw(panel.WSEventReportDevices, data)
+	// Route through the WS client's pending-report path so machine-mode
+	// reports get the same coalescing and retry guarantees as single-node mode.
+	p.ws.SendDeviceReportForNode(p.nodeID, devices)
 }

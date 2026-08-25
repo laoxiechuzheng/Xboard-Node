@@ -184,6 +184,35 @@ func TestFlushAliveIPs_DedupSameIP(t *testing.T) {
 	}
 }
 
+func TestSnapshotAliveIPsBypassesDedup(t *testing.T) {
+	tr := New()
+	aliveIPs := map[int]map[string]bool{
+		1: {"1.1.1.1": true, "2.2.2.2": true},
+	}
+	tr.Process(map[int][2]int64{1: {100, 200}}, aliveIPs, 2)
+
+	if got := tr.FlushAliveIPs(); got == nil {
+		t.Fatal("expected first flush to return alive IPs")
+	}
+	if got := tr.FlushAliveIPs(); got != nil {
+		t.Fatalf("expected duplicate flush to return nil, got %v", got)
+	}
+
+	snap := tr.SnapshotAliveIPs()
+	if len(snap[1]) != 2 {
+		t.Fatalf("snapshot user 1 IPs: got %d, want 2", len(snap[1]))
+	}
+
+	// The snapshot must be an independent copy: mutating it must not leak back.
+	snap[1][0] = "9.9.9.9"
+	snap2 := tr.SnapshotAliveIPs()
+	for _, ip := range snap2[1] {
+		if ip == "9.9.9.9" {
+			t.Fatalf("snapshot leaked caller mutation: %v", snap2[1])
+		}
+	}
+}
+
 func TestHasTraffic(t *testing.T) {
 	tr := New()
 	if tr.HasTraffic() {

@@ -289,3 +289,168 @@ func TestWSClient_UserDeltaEvent(t *testing.T) {
 		t.Errorf("unexpected DeltaUsers: %+v", received[0].DeltaUsers)
 	}
 }
+
+func TestWSClient_DeviceReportDeliveredImmediatelyAfterConnect(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+
+	var mu sync.Mutex
+	var reports []wsMessage
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if err := conn.WriteJSON(wsMessage{Event: "auth.success"}); err != nil {
+			return
+		}
+		for {
+			var msg wsMessage
+			if err := conn.ReadJSON(&msg); err != nil {
+				return
+			}
+			if msg.Event == WSEventReportDevices {
+				mu.Lock()
+				reports = append(reports, msg)
+				mu.Unlock()
+			}
+		}
+	}))
+	defer server.Close()
+
+	host := strings.TrimPrefix(server.URL, "http://")
+	var ws *WSClient
+	ws = NewWSClient("ws://"+host, "report-token", 1, WSClientConfig{StatusInterval: time.Hour}, func(WSEvent) {}, func(status WSStatusChange) {
+		if status.Connected {
+			ws.SendDeviceReportForNode(1, map[int][]string{7: {"10.0.0.1"}})
+		}
+	}, func() map[string]interface{} { return nil })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go ws.Run(ctx)
+
+	deadline := time.After(4 * time.Second)
+	for {
+		mu.Lock()
+		n := len(reports)
+		mu.Unlock()
+		if n >= 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			mu.Lock()
+			defer mu.Unlock()
+			t.Fatalf("timed out waiting for device report, got %d", len(reports))
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reports) == 0 {
+		t.Fatal("expected at least one report.devices message")
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(reports[0].Data, &payload); err != nil {
+		t.Fatalf("unmarshal report payload: %v", err)
+	}
+	if int(payload["node_id"].(float64)) != 1 {
+		t.Errorf("node_id: got %v, want 1", payload["node_id"])
+	}
+}
+
+func TestWSClient_PendingDeviceReportCoalescesPerNodeLatestWins(t *testing.T) {
+	w := &WSClient{devWake: make(chan struct{}, 1)}
+
+	w.enqueueDeviceReport(1, &wsMessage{Event: WSEventReportDevices, Data: json.RawMessage(`"one-a"`)})
+	w.enqueueDeviceReport(1, &wsMessage{Event: WSEventReportDevices, Data: json.RawMessage(`"one-b"`)})
+	w.enqueueDeviceReport(2, &wsMessage{Event: WSEventReportDevices, Data: json.RawMessage(`"two"`)})
+
+	got := make(map[int]*pendingDevice)
+	for {
+		pd := w.takePendingDevice()
+		if pd == nil {
+			break
+		}
+		got[pd.nodeID] = pd
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 pending device reports (one per node), got %d", len(got))
+	}
+	if string(got[1].msg.Data) != `"one-b"` {
+		t.Errorf("node 1 pending: got %s, want one-b (latest wins)", got[1].msg.Data)
+	}
+	if string(got[2].msg.Data) != `"two"` {
+		t.Errorf("node 2 pending: got %s, want two", got[2].msg.Data)
+	}
+
+	// A failed write restores the pending slot so it is retried.
+	w.restorePendingDevice(got[1])
+	restored := w.takePendingDevice()
+	if restored == nil || string(restored.msg.Data) != `"one-b"` {
+		t.Fatalf("restored pending device report mismatch: %+v", restored)
+	}
+}
+
+func TestWSClient_ReadTimeoutDisconnectsSilentConnection(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if err := conn.WriteJSON(wsMessage{Event: "auth.success"}); err != nil {
+			return
+		}
+		// Stay silent: never send ping/pong or data. The client must notice the
+		// half-open connection via its read deadline.
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	host := strings.TrimPrefix(server.URL, "http://")
+	var mu sync.Mutex
+	var statuses []bool
+	ws := NewWSClient("ws://"+host, "timeout-token", 1, WSClientConfig{
+		ReadTimeout:    200 * time.Millisecond,
+		StatusInterval: time.Hour,
+		BackoffInitial: time.Hour,
+		BackoffMax:     time.Hour,
+	}, func(WSEvent) {}, func(status WSStatusChange) {
+		mu.Lock()
+		statuses = append(statuses, status.Connected)
+		mu.Unlock()
+	}, func() map[string]interface{} { return nil })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go ws.Run(ctx)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		mu.Lock()
+		sawDisconnect := false
+		for _, s := range statuses {
+			if !s {
+				sawDisconnect = true
+			}
+		}
+		mu.Unlock()
+		if sawDisconnect {
+			break
+		}
+		select {
+		case <-deadline:
+			mu.Lock()
+			defer mu.Unlock()
+			t.Fatalf("timed out waiting for read-timeout disconnect, statuses: %v", statuses)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}

@@ -124,6 +124,7 @@ func (p *PanelControlPlane) newPushClient(metricsFn func() map[string]interface{
 	cfg := panel.WSClientConfig{
 		StatusInterval:   time.Duration(p.wsCfg.StatusInterval) * time.Second,
 		HandshakeTimeout: time.Duration(p.wsCfg.HandshakeTimeout) * time.Second,
+		ReadTimeout:      time.Duration(p.wsCfg.ReadTimeout) * time.Second,
 		BackoffInitial:   time.Duration(p.wsCfg.BackoffInitial) * time.Second,
 		BackoffMax:       time.Duration(p.wsCfg.BackoffMax) * time.Second,
 	}
@@ -142,16 +143,23 @@ func (p *PanelControlPlane) newPushClient(metricsFn func() map[string]interface{
 			case events <- translated:
 			default:
 				nlog.Core().Warn("ws event channel full, dropping event", "type", translated.Type)
-				select {
-				case statuses <- StatusChange{Connected: true, NeedsResync: true}:
-				default:
-				}
+				// A dropped event may leave local state stale. Ask the service to
+				// reconcile via REST, waiting briefly if the status channel is
+				// momentarily full instead of dropping the request too.
+				go func() {
+					select {
+					case statuses <- StatusChange{Connected: true, NeedsResync: true}:
+					case <-time.After(30 * time.Second):
+						nlog.Core().Warn("ws resync request dropped after timeout")
+					}
+				}()
 			}
 		},
 		func(status panel.WSStatusChange) {
 			select {
 			case statuses <- StatusChange{Connected: status.Connected}:
 			default:
+				nlog.Core().Warn("ws status channel full, dropping status change", "connected", status.Connected)
 			}
 		},
 		metricsFn,

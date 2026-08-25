@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net/url"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -88,6 +89,7 @@ type syncNodesPayload struct {
 type WSClientConfig struct {
 	StatusInterval   time.Duration
 	HandshakeTimeout time.Duration
+	ReadTimeout      time.Duration
 	BackoffInitial   time.Duration
 	BackoffMax       time.Duration
 	MachineID        int
@@ -111,6 +113,20 @@ type WSClient struct {
 	// writeCh allows sending messages from outside the connect loop.
 	// It is set in connect() and cleared on disconnect.
 	writeCh chan wsMessage
+
+	// Device reports are coalesced per node (latest wins) instead of being
+	// dropped when the write path is busy. The connect loop drains pending
+	// reports and retries them on the next connection if a write fails.
+	devMu      sync.Mutex
+	devPending map[int]*pendingDevice
+	devWake    chan struct{}
+}
+
+// pendingDevice is one unsent report.devices message, keyed by node_id.
+// nodeID == 0 is the legacy single-node mode.
+type pendingDevice struct {
+	nodeID int
+	msg    *wsMessage
 }
 
 // NewWSClient creates a new WebSocket client.
@@ -123,6 +139,11 @@ func NewWSClient(wsURL string, token string, nodeID int, cfg WSClientConfig, onE
 	}
 	if cfg.HandshakeTimeout == 0 {
 		cfg.HandshakeTimeout = 15 * time.Second
+	}
+	if cfg.ReadTimeout == 0 {
+		// The panel pings every ~55s. Two missed pings means the read side is
+		// half-open and should be torn down for reconnect.
+		cfg.ReadTimeout = 150 * time.Second
 	}
 	if cfg.BackoffInitial == 0 {
 		cfg.BackoffInitial = time.Second
@@ -223,6 +244,32 @@ func (w *WSClient) connect(ctx context.Context) error {
 
 	conn.SetReadLimit(10 << 20) // 10MB max message size
 
+	// Create the device-report wake channel and adopt any pending reports
+	// BEFORE marking the connection as connected: the service reacts to the
+	// connected notification by forcing a device snapshot, and that report
+	// must have somewhere to land.
+	devWake := make(chan struct{}, 1)
+	w.devMu.Lock()
+	w.devWake = devWake
+	if len(w.devPending) > 0 {
+		select {
+		case devWake <- struct{}{}:
+		default:
+		}
+	}
+	w.devMu.Unlock()
+	defer func() {
+		w.devMu.Lock()
+		w.devWake = nil
+		w.devMu.Unlock()
+	}()
+
+	// Bound the auth handshake read so a silent server cannot block startup
+	// forever.
+	if err := conn.SetReadDeadline(time.Now().Add(w.cfg.HandshakeTimeout)); err != nil {
+		return fmt.Errorf("set auth read deadline: %w", err)
+	}
+
 	// Read first message — expect auth.success or error
 	var firstMsg wsMessage
 	if err := conn.ReadJSON(&firstMsg); err != nil {
@@ -266,6 +313,11 @@ func (w *WSClient) connect(ctx context.Context) error {
 	go func() {
 		defer close(done)
 		for {
+			// Reset the read deadline on every iteration: any message (including
+			// the panel's periodic ping) proves the read side is alive. If no
+			// message arrives for ReadTimeout the connection is treated as
+			// half-open and torn down so Run() can reconnect.
+			conn.SetReadDeadline(time.Now().Add(w.cfg.ReadTimeout))
 			var msg wsMessage
 			if err := conn.ReadJSON(&msg); err != nil {
 				select {
@@ -320,6 +372,24 @@ func (w *WSClient) connect(ctx context.Context) error {
 			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := conn.WriteJSON(msg); err != nil {
 				return fmt.Errorf("write: %w", err)
+			}
+
+		case <-devWake:
+			// Drain all pending device reports. Pending reports are the
+			// reliability-critical path: they are coalesced per node and never
+			// silently dropped. A failed write restores the report so the next
+			// connection retries it.
+			for {
+				pd := w.takePendingDevice()
+				if pd == nil {
+					break
+				}
+				nlog.Core().Debug("ws send", "event", pd.msg.Event, "data", string(pd.msg.Data))
+				conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err := conn.WriteJSON(pd.msg); err != nil {
+					w.restorePendingDevice(pd)
+					return fmt.Errorf("write device report: %w", err)
+				}
 			}
 		}
 	}
@@ -471,10 +541,55 @@ func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string)
 		Timestamp: time.Now().Unix(),
 	}
 
-	select {
-	case w.writeCh <- msg:
-	default:
-		nlog.Core().Warn("ws write channel full, skipping device report")
+	// Coalesce (latest wins) and let the connect loop retry instead of
+	// silently dropping the report under write backpressure.
+	w.enqueueDeviceReport(nodeID, &msg)
+}
+
+// enqueueDeviceReport stores the latest pending report for a node and wakes
+// the connect write loop. Reports are coalesced per node: only the newest
+// snapshot for each node survives, which is correct because the panel treats
+// report.devices as a full-state replacement.
+func (w *WSClient) enqueueDeviceReport(nodeID int, msg *wsMessage) {
+	w.devMu.Lock()
+	defer w.devMu.Unlock()
+	if w.devPending == nil {
+		w.devPending = make(map[int]*pendingDevice)
+	}
+	w.devPending[nodeID] = &pendingDevice{nodeID: nodeID, msg: msg}
+	if w.devWake != nil {
+		select {
+		case w.devWake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// takePendingDevice removes and returns one pending report, or nil when none
+// are queued.
+func (w *WSClient) takePendingDevice() *pendingDevice {
+	w.devMu.Lock()
+	defer w.devMu.Unlock()
+	for nodeID, pd := range w.devPending {
+		delete(w.devPending, nodeID)
+		return pd
+	}
+	return nil
+}
+
+// restorePendingDevice puts a failed report back so it is retried on the next
+// connection. A newer report for the same node (if any) is kept.
+func (w *WSClient) restorePendingDevice(pd *pendingDevice) {
+	if pd == nil {
+		return
+	}
+	w.devMu.Lock()
+	defer w.devMu.Unlock()
+	if w.devPending == nil {
+		w.devPending = make(map[int]*pendingDevice)
+	}
+	if _, exists := w.devPending[pd.nodeID]; !exists {
+		w.devPending[pd.nodeID] = pd
 	}
 }
 
