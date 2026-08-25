@@ -811,7 +811,7 @@ func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 		email := userEmail(u.ID)
 		emailToUID[email] = u.ID
 		emailToUID[u.UUID] = u.ID
-		if u.DeviceLimit > 0 {
+		if x.cfg.DeviceLimitEnforce && u.DeviceLimit > 0 {
 			deviceLimits[email] = u.DeviceLimit
 			deviceLimits[u.UUID] = u.DeviceLimit
 		}

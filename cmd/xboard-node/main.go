@@ -49,7 +49,7 @@ func main() {
 	config.InitLogger(instances[0].Log)
 
 	// Apply runtime memory tuning before anything else allocates.
-	applyRuntimeConfig(instances[0].Runtime)
+	applyRuntimeConfig(instances[0].Runtime, instances[0].Kernel.Type)
 
 	runWithReload(rootCfg, *configPath)
 }
@@ -242,33 +242,45 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 			os.Exit(1)
 		}
 		config.InitLogger(newInstances[0].Log)
-		applyRuntimeConfig(newInstances[0].Runtime)
+		applyRuntimeConfig(newInstances[0].Runtime, newInstances[0].Kernel.Type)
 		root = newRoot
 		nlog.Core().Info("reload complete, services restarting with new config")
 	}
 }
+
+// defaultSingboxGoMemLimit is applied only when the config does not set
+// runtime.gomemlimit and GOMEMLIMIT env is unset. sing-box holds a much
+// larger Go runtime headroom than xray under load, so a conservative soft
+// default keeps resident memory bounded. This is a soft limit: GC becomes
+// more aggressive above it, never an OOM kill. Override via runtime.gomemlimit
+// (set 0 to disable is not supported; omit for xray).
+const defaultSingboxGoMemLimit = "384MiB"
 
 // applyRuntimeConfig wires up Go runtime memory limits from the config file.
 // Both settings can also be overridden by environment variables (GOMEMLIMIT /
 // GOGC) — the env vars take precedence because Go's runtime reads them before
 // we can call these functions, but we set them here for completeness and so
 // the values are logged.
-func applyRuntimeConfig(rt config.RuntimeConfig) {
+func applyRuntimeConfig(rt config.RuntimeConfig, kernelType string) {
 	// GOGC
 	if rt.GoGCPercent > 0 {
 		prev := debug.SetGCPercent(rt.GoGCPercent)
 		nlog.Core().Info("runtime: GOGC set", "gogc", rt.GoGCPercent, "prev", prev)
 	}
 
-	// GOMEMLIMIT — parse human-readable size string (e.g. "30MiB")
-	if rt.GoMemLimit != "" {
-		limit, err := parseMemLimit(rt.GoMemLimit)
+	// GOMEMLIMIT — parse human-readable size string (e.g. "30MiB").
+	limitStr := rt.GoMemLimit
+	if limitStr == "" && strings.EqualFold(kernelType, "singbox") && os.Getenv("GOMEMLIMIT") == "" {
+		limitStr = defaultSingboxGoMemLimit
+	}
+	if limitStr != "" {
+		limit, err := parseMemLimit(limitStr)
 		if err != nil {
-			nlog.Core().Warn("runtime: invalid gomemlimit, ignoring", "value", rt.GoMemLimit, "error", err)
+			nlog.Core().Warn("runtime: invalid gomemlimit, ignoring", "value", limitStr, "error", err)
 		} else {
 			prev := debug.SetMemoryLimit(limit)
 			nlog.Core().Info("runtime: GOMEMLIMIT set",
-				"limit", rt.GoMemLimit,
+				"limit", limitStr,
 				"bytes", limit,
 				"prev_bytes", prev,
 			)

@@ -242,10 +242,19 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 }
 
-func (s *Service) initialSetup(ctx context.Context) error {
-	// Register speed limit lookup with kernel unconditionally (before push/poll branch).
+// wireKernelCallbacks registers the speed-limit lookup unconditionally and
+// the device-limit lookup only when enforcement is enabled. Device IPs are
+// always tracked and reported to the panel; with enforcement disabled
+// (default) an over-limit user is recorded but never rejected.
+func (s *Service) wireKernelCallbacks() {
 	s.kernel.SetSpeedLimitFunc(s.speedTracker.GetLimiter)
-	s.kernel.SetDeviceLimitFunc(s.limiter.GetDeviceLimitByUUID)
+	if s.cfg.Kernel.DeviceLimitEnforce {
+		s.kernel.SetDeviceLimitFunc(s.limiter.GetDeviceLimitByUUID)
+	}
+}
+func (s *Service) initialSetup(ctx context.Context) error {
+	// Register kernel callbacks before the push/poll branch.
+	s.wireKernelCallbacks()
 
 	bootstrap, err := s.source.Initial(ctx, s.wsMetrics, s.wsEvents, s.wsStatusCh)
 	if err != nil {

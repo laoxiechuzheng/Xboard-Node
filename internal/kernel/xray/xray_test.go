@@ -118,7 +118,7 @@ func TestXrayGetUserTrafficUsesBuiltInStatsAndDispatcherState(t *testing.T) {
 }
 
 func TestXrayUpdateDispatcherLimitsPropagatesDeviceMetadata(t *testing.T) {
-	x := New(config.KernelConfig{Type: "xray"})
+	x := New(config.KernelConfig{Type: "xray", DeviceLimitEnforce: true})
 	ld := newTestDispatcher()
 	x.limitDispatcher = ld
 
@@ -231,7 +231,7 @@ func TestXrayUpdateBandwidthLimitsFallsBackToUserSpeed(t *testing.T) {
 
 
 func TestXrayUpdateUsersLimitOnlyRefreshesDispatcherAndBandwidth(t *testing.T) {
-	x := New(config.KernelConfig{Type: "xray"})
+	x := New(config.KernelConfig{Type: "xray", DeviceLimitEnforce: true})
 	ld := newTestDispatcher()
 	inst := new(xrayCore.Instance)
 	bm := featurebandwidth.New()
@@ -274,5 +274,34 @@ func TestXrayRemoveUsersStopsKernelWhenLastUserRemoved(t *testing.T) {
 	}
 	if x.IsRunning() {
 		t.Fatal("expected xray to stop when last user is removed")
+	}
+}
+
+func TestUpdateDispatcherLimitsDeviceLimitEnforce(t *testing.T) {
+	users := []model.UserSpec{{ID: 1, UUID: "11111111-1111-1111-1111-111111111111", DeviceLimit: 2}}
+
+	ldOff := &LimitDispatcher{
+		limitedIPs:   make(map[string]map[string]int),
+		deviceLimits: make(map[string]int),
+		emailToUID:   make(map[string]int),
+	}
+	xOff := &Xray{cfg: config.KernelConfig{DeviceLimitEnforce: false}, limitDispatcher: ldOff}
+	xOff.updateDispatcherLimits(users)
+	if len(ldOff.deviceLimits) != 0 {
+		t.Fatalf("deviceLimits should stay empty when enforcement is disabled, got %v", ldOff.deviceLimits)
+	}
+	if ldOff.emailToUID[users[0].UUID] != users[0].ID {
+		t.Fatal("emailToUID should still map user UUID for device reporting")
+	}
+
+	ldOn := &LimitDispatcher{
+		limitedIPs:   make(map[string]map[string]int),
+		deviceLimits: make(map[string]int),
+		emailToUID:   make(map[string]int),
+	}
+	xOn := &Xray{cfg: config.KernelConfig{DeviceLimitEnforce: true}, limitDispatcher: ldOn}
+	xOn.updateDispatcherLimits(users)
+	if ldOn.deviceLimits[users[0].UUID] != 2 {
+		t.Fatalf("deviceLimits should be populated when enforcement is enabled, got %v", ldOn.deviceLimits)
 	}
 }

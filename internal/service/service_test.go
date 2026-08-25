@@ -296,3 +296,31 @@ func TestValidateNodeRuntimeRejectsRealityWithoutServerNameOrDest(t *testing.T) 
 		t.Fatalf("unexpected error: %v", got)
 	}
 }
+
+func TestWireKernelCallbacksDeviceLimitEnforcement(t *testing.T) {
+	sharedLimiter := limiter.New()
+	k := &fakeKernel{}
+	s := &Service{
+		kernel:       k,
+		limiter:      sharedLimiter,
+		speedTracker: limiter.NewSpeedTracker(sharedLimiter),
+		cfg:          &config.Config{Kernel: config.KernelConfig{DeviceLimitEnforce: false}},
+	}
+
+	// Default (false): device limit lookup must NOT be registered.
+	s.wireKernelCallbacks()
+	if k.speedLimitFunc == nil {
+		t.Fatal("speed limit callback should always be registered")
+	}
+	if k.deviceLimitFunc != nil {
+		t.Fatal("device limit callback should not be registered when enforcement is disabled")
+	}
+
+	// Enabled: device limit lookup must be registered.
+	k.deviceLimitFunc = nil
+	s.cfg.Kernel.DeviceLimitEnforce = true
+	s.wireKernelCallbacks()
+	if k.deviceLimitFunc == nil {
+		t.Fatal("device limit callback should be registered when enforcement is enabled")
+	}
+}

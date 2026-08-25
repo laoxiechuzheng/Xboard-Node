@@ -124,6 +124,12 @@ type KernelConfig struct {
 	AuditLog           string `yaml:"audit_log"`
 	ForceProxyProtocol bool   `yaml:"force_proxy_protocol"`
 
+	// DeviceLimitEnforce enables admission enforcement when a user exceeds
+	// their device limit. When false (the default), device IPs are still
+	// tracked and reported to the panel (record-only), but connections are
+	// never rejected. Set to true to restore the legacy reject behaviour.
+	DeviceLimitEnforce bool `yaml:"device_limit_enforce"`
+
 	// GeoDataDir is the directory that contains GeoIP/GeoSite database files.
 	// For sing-box: geoip.db and geosite.db (geoip2-format).
 	// For xray:     geoip.dat and geosite.dat.

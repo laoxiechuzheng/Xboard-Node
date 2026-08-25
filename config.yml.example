@@ -26,9 +26,15 @@
 #   #   tcp_keep_alive: "15m"          # optional sing-box listen option
 #   #   tcp_keep_alive_interval: "30s" # optional sing-box listen option
 #   #   udp_timeout: "5m"               # optional sing-box listen option
+#   #   device_limit_enforce: false     # default false: device IPs are still
+#   #                                   # tracked & reported, but over-limit
+#   #                                   # users are never rejected. Set true to
+#   #                                   # enforce (reject new devices).
 # log:
 #   level: "none"      # disable xboard-node application logs
 # runtime:
+#   # singbox default: 384MiB soft cap is applied when gomemlimit is omitted
+#   # (xray: no default). Lower = less RSS, slightly more GC CPU.
 #   gomemlimit: "600MiB"  # soft RSS cap; GC becomes aggressive above this
 #   gogc: 70              # lower = less memory, more GC CPU (default 100)
 # instances:
