@@ -263,4 +263,9 @@ require (
 
 replace github.com/sagernet/sing-box => github.com/laoxiechuzheng/sing-box v1.14.0-laoxie.1
 
+// Keep the existing sing-quic/quic-go/sing versions and backport only the
+// upstream UDP message-ownership fix. The replacement is deliberately at the
+// main module so it applies transitively to the sing-box fork.
+replace github.com/sagernet/sing-quic => github.com/laoxiechuzheng/sing-quic v0.6.0-laoxie.1
+
 replace github.com/xtls/xray-core => github.com/laoxiechuzheng/Xray-core v1.260327.0-laoxie.1
