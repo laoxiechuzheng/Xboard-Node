@@ -54,11 +54,11 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	}
 
 	cfg := M{
-		"log": logConfig,
+		"log":       logConfig,
 		"outbounds": outbounds,
 	}
 
-	inbound := buildInbound(nc, users, tc)
+	inbound := buildInbound(nc, users, tc, kcfg)
 	if inbound != nil {
 		cfg["inbounds"] = []M{inbound}
 	}
@@ -434,11 +434,28 @@ func mergeCustomSingboxRoute(cfg M, customRoute map[string]any) {
 	}
 }
 
-func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
+// buildInbound builds the sing-box inbound for a node. The optional kcfg
+// carries connection lifecycle options (tcp keepalive / udp timeout). It is
+// variadic so existing tests that call buildInbound without a kernel config
+// keep compiling.
+func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert, kcfgs ...config.KernelConfig) M {
 	base := M{
 		"tag":         nc.Protocol + "-in",
 		"listen":      "::",
 		"listen_port": nc.ServerPort,
+	}
+
+	if len(kcfgs) > 0 {
+		kcfg := kcfgs[0]
+		if kcfg.TCPKeepAlive != "" {
+			base["tcp_keep_alive"] = kcfg.TCPKeepAlive
+		}
+		if kcfg.TCPKeepAliveInterval != "" {
+			base["tcp_keep_alive_interval"] = kcfg.TCPKeepAliveInterval
+		}
+		if kcfg.UDPTimeout != "" {
+			base["udp_timeout"] = kcfg.UDPTimeout
+		}
 	}
 
 	switch nc.Protocol {

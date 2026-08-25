@@ -36,7 +36,49 @@ func TestSingBoxCapabilities(t *testing.T) {
 	}
 }
 
+func TestIdleTimeoutFromConfig(t *testing.T) {
+	if got := idleTimeoutFromConfig(config.KernelConfig{}); got != 35*time.Second {
+		t.Errorf("default idle timeout = %v, want 35s", got)
+	}
+	if got := idleTimeoutFromConfig(config.KernelConfig{IdleTimeout: 10}); got != 10*time.Second {
+		t.Errorf("explicit idle timeout = %v, want 10s", got)
+	}
+	if got := idleTimeoutFromConfig(config.KernelConfig{IdleTimeout: -1}); got != 0 {
+		t.Errorf("disabled idle timeout = %v, want 0", got)
+	}
+}
 
+func TestConnTrackerIdleJanitorClosesStaleConn(t *testing.T) {
+	tr := NewConnTracker(50 * time.Millisecond)
+	conn := &testConn{}
+	entry := &trackedEntry{conn: conn}
+	entry.lastSeen.Store(time.Now().Add(-time.Second).UnixNano())
+
+	tr.usersMu.Lock()
+	tr.connMap["stale"] = entry
+	tr.usersMu.Unlock()
+
+	tr.closeIdleConns()
+	if !conn.closed {
+		t.Error("stale idle connection was not closed")
+	}
+}
+
+func TestConnTrackerIdleJanitorKeepsFreshConn(t *testing.T) {
+	tr := NewConnTracker(50 * time.Millisecond)
+	conn := &testConn{}
+	entry := &trackedEntry{conn: conn}
+	entry.touch()
+
+	tr.usersMu.Lock()
+	tr.connMap["fresh"] = entry
+	tr.usersMu.Unlock()
+
+	tr.closeIdleConns()
+	if conn.closed {
+		t.Error("fresh connection should not be closed")
+	}
+}
 
 type testConn struct {
 	closed bool
@@ -60,11 +102,11 @@ func (c *testConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func (c *testConn) Close() error { c.closed = true; return nil }
-func (c *testConn) LocalAddr() net.Addr { return &net.TCPAddr{} }
-func (c *testConn) RemoteAddr() net.Addr { return &net.TCPAddr{} }
-func (c *testConn) SetDeadline(time.Time) error { return nil }
-func (c *testConn) SetReadDeadline(time.Time) error { return nil }
+func (c *testConn) Close() error                     { c.closed = true; return nil }
+func (c *testConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *testConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (c *testConn) SetDeadline(time.Time) error      { return nil }
+func (c *testConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *testConn) SetWriteDeadline(time.Time) error { return nil }
 
 func testInboundContext(uuid, ip string) adapter.InboundContext {

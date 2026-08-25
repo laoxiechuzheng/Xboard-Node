@@ -19,14 +19,14 @@ import (
 )
 
 type Config struct {
-	InstanceID string `yaml:"-"`
-	Panel   PanelConfig   `yaml:"panel"`
-	Node    NodeConfig    `yaml:"node"`
-	Kernel  KernelConfig  `yaml:"kernel"`
-	Cert    CertConfig    `yaml:"cert"`
-	Log     LogConfig     `yaml:"log"`
-	Runtime RuntimeConfig `yaml:"runtime"`
-	WS      WSConfig      `yaml:"ws"`
+	InstanceID string        `yaml:"-"`
+	Panel      PanelConfig   `yaml:"panel"`
+	Node       NodeConfig    `yaml:"node"`
+	Kernel     KernelConfig  `yaml:"kernel"`
+	Cert       CertConfig    `yaml:"cert"`
+	Log        LogConfig     `yaml:"log"`
+	Runtime    RuntimeConfig `yaml:"runtime"`
+	WS         WSConfig      `yaml:"ws"`
 	// Standalone enables a local-only node that never contacts the panel.
 	Standalone *StandaloneConfig `yaml:"standalone,omitempty"`
 	// HealthPort enables a lightweight HTTP health-check endpoint on the
@@ -118,11 +118,11 @@ type WSConfig struct {
 }
 
 type KernelConfig struct {
-	Type      string `yaml:"type"` // "singbox" or "xray"
-	ConfigDir string `yaml:"config_dir"`
-	LogLevel  string `yaml:"log_level"`
-	AuditLog  string `yaml:"audit_log"`
-	ForceProxyProtocol bool `yaml:"force_proxy_protocol"`
+	Type               string `yaml:"type"` // "singbox" or "xray"
+	ConfigDir          string `yaml:"config_dir"`
+	LogLevel           string `yaml:"log_level"`
+	AuditLog           string `yaml:"audit_log"`
+	ForceProxyProtocol bool   `yaml:"force_proxy_protocol"`
 
 	// GeoDataDir is the directory that contains GeoIP/GeoSite database files.
 	// For sing-box: geoip.db and geosite.db (geoip2-format).
@@ -144,6 +144,37 @@ type KernelConfig struct {
 	// customization of dns, outbounds, endpoints, route, experimental, etc.
 	// Compatible with V2bX OriginalPath format.
 	CustomConfig string `yaml:"custom_config"`
+
+	// XrayPolicy mirrors xray-core policy levels.0 (timeouts + buffer size).
+	// Zero values use the recommended defaults:
+	//   handshake=4, conn_idle=35, uplink_only=3, downlink_only=5, buffer_size=128
+	// BufferSizeKB: 0 = default (128KB), -1 = unlimited, N = N KB.
+	XrayPolicy XrayPolicyConfig `yaml:"xray_policy"`
+
+	// IdleTimeout is the singbox TCP connection idle timeout in seconds.
+	// A TCP connection with no traffic for this long is closed by an internal
+	// janitor (the sing-box equivalent of xray's connIdle).
+	// 0 = default (35s), -1 = disabled.
+	IdleTimeout int `yaml:"idle_timeout"`
+
+	// TCPKeepAlive / TCPKeepAliveInterval map to sing-box listen options
+	// (for example "15m" / "30s"). Empty means sing-box default.
+	TCPKeepAlive         string `yaml:"tcp_keep_alive"`
+	TCPKeepAliveInterval string `yaml:"tcp_keep_alive_interval"`
+
+	// UDPTimeout maps to sing-box udp_timeout (for example "5m"). Empty means
+	// sing-box default.
+	UDPTimeout string `yaml:"udp_timeout"`
+}
+
+// XrayPolicyConfig mirrors xray-core policy levels.0 fields. All timeout
+// fields are in seconds. BufferSizeKB is per-connection buffer size in KB.
+type XrayPolicyConfig struct {
+	Handshake    int `yaml:"handshake"`     // seconds, default 4
+	ConnIdle     int `yaml:"conn_idle"`     // seconds, default 35
+	UplinkOnly   int `yaml:"uplink_only"`   // seconds, default 3
+	DownlinkOnly int `yaml:"downlink_only"` // seconds, default 5
+	BufferSizeKB int `yaml:"buffer_size"`   // KB per connection, default 128; -1 = unlimited
 }
 
 type CertConfig struct {
@@ -520,6 +551,21 @@ func (c *Config) inheritFrom(parent *Config) {
 	}
 	if len(c.Kernel.CustomRoute) == 0 {
 		c.Kernel.CustomRoute = parent.Kernel.CustomRoute
+	}
+	if c.Kernel.XrayPolicy == (XrayPolicyConfig{}) {
+		c.Kernel.XrayPolicy = parent.Kernel.XrayPolicy
+	}
+	if c.Kernel.IdleTimeout == 0 {
+		c.Kernel.IdleTimeout = parent.Kernel.IdleTimeout
+	}
+	if c.Kernel.TCPKeepAlive == "" {
+		c.Kernel.TCPKeepAlive = parent.Kernel.TCPKeepAlive
+	}
+	if c.Kernel.TCPKeepAliveInterval == "" {
+		c.Kernel.TCPKeepAliveInterval = parent.Kernel.TCPKeepAliveInterval
+	}
+	if c.Kernel.UDPTimeout == "" {
+		c.Kernel.UDPTimeout = parent.Kernel.UDPTimeout
 	}
 	// Cert (NOT cert_dir — derived from config_dir later)
 	if c.Cert.CertMode == "" {

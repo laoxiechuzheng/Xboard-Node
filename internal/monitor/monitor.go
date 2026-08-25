@@ -117,8 +117,36 @@ func collectNetSpeed() (inSpeed, outSpeed float64) {
 	return inSpeed, outSpeed
 }
 
-// Collect gathers current system metrics
+// collectCache shares the latest system metrics across all Service instances
+// in one process. Merged multi-instance configs run many services, each of
+// which used to call Collect() on its own cadence, multiplying syscalls and
+// runtime.ReadMemStats STW pauses.
+var collectCache struct {
+	mu     sync.Mutex
+	last   Status
+	lastAt time.Time
+}
+
+// collectTTL bounds how stale a cached snapshot may be.
+const collectTTL = time.Second
+
+// Collect returns process-wide system metrics, cached for up to 1 second.
+// Concurrent callers are serialized so the OS is sampled at most once per TTL.
 func Collect() Status {
+	collectCache.mu.Lock()
+	defer collectCache.mu.Unlock()
+	if time.Since(collectCache.lastAt) < collectTTL {
+		return collectCache.last
+	}
+	s := collect()
+	collectCache.last = s
+	collectCache.lastAt = time.Now()
+	return s
+}
+
+// collect gathers current system metrics. Callers must hold collectCache.mu
+// via Collect().
+func collect() Status {
 	var s Status
 
 	s.Uptime = uint64(time.Since(startTime).Seconds())

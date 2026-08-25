@@ -11,8 +11,26 @@
 # kernel:
 #   type: "singbox"
 #   log_level: "none"  # disable embedded sing-box/xray logs and xray audit logging
+#   # ── xray connection policy (levels.0). Recommended defaults when omitted:
+#   #    handshake=4 conn_idle=35 uplink_only=3 downlink_only=5 buffer_size=128
+#   #   xray_policy:
+#   #     handshake: 4       # seconds
+#   #     conn_idle: 35      # seconds
+#   #     uplink_only: 3     # seconds
+#   #     downlink_only: 5   # seconds
+#   #     buffer_size: 128   # KB per connection; -1 = unlimited
+#   # ── singbox connection lifecycle:
+#   #   idle_timeout: 35     # seconds with no traffic before a TCP conn is
+#   #                        # closed (sing-box equivalent of xray connIdle).
+#   #                        # 0 = default 35, negative = disabled.
+#   #   tcp_keep_alive: "15m"          # optional sing-box listen option
+#   #   tcp_keep_alive_interval: "30s" # optional sing-box listen option
+#   #   udp_timeout: "5m"               # optional sing-box listen option
 # log:
 #   level: "none"      # disable xboard-node application logs
+# runtime:
+#   gomemlimit: "600MiB"  # soft RSS cap; GC becomes aggressive above this
+#   gogc: 70              # lower = less memory, more GC CPU (default 100)
 # instances:
 #   - panel:
 #       url: "https://panel.example.com"

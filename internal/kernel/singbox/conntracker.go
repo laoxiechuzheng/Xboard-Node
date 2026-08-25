@@ -123,11 +123,16 @@ func (u *userStats) aliveIPList() map[string]bool {
 //   - Per-connection rate limit token accumulation (amortized WaitN)
 type ConnTracker struct {
 	usersMu sync.RWMutex
-	users   map[int]*userStats  // userID → stats
-	uuidMap map[string]int      // UUID → userID (for lookup in RoutedConnection)
-	connMap map[string]net.Conn // connID → conn (only for force-close support)
+	users   map[int]*userStats       // userID → stats
+	uuidMap map[string]int           // UUID → userID (for lookup in RoutedConnection)
+	connMap map[string]*trackedEntry // connID → live TCP conn (force-close + idle janitor)
 
 	idCounter atomic.Int64
+
+	// idleTimeout is the sing-box equivalent of xray's connIdle. A TCP
+	// connection with no read/write activity for this long is closed by the
+	// idle janitor. 0 disables the janitor.
+	idleTimeout time.Duration
 
 	// speedLimitFunc resolves a user UUID to a *rate.Limiter.
 	speedLimitFunc atomic.Pointer[func(uuid string) *rate.Limiter]
@@ -142,13 +147,26 @@ type ConnTracker struct {
 }
 
 // NewConnTracker creates a tracker.
-func NewConnTracker(_ int) *ConnTracker {
+func NewConnTracker(idleTimeout time.Duration) *ConnTracker {
 	return &ConnTracker{
 		users:         make(map[int]*userStats),
 		uuidMap:       make(map[string]int),
-		connMap:       make(map[string]net.Conn),
+		connMap:       make(map[string]*trackedEntry),
 		globalDevices: make(map[int]map[string]bool),
+		idleTimeout:   idleTimeout,
 	}
+}
+
+// trackedEntry is a live TCP connection together with its last activity
+// timestamp. lastSeen is updated from the data path (Read/Write/CountFunc),
+// so it measures real traffic, not connection setup.
+type trackedEntry struct {
+	conn     net.Conn
+	lastSeen atomic.Int64 // unix nanoseconds
+}
+
+func (e *trackedEntry) touch() {
+	e.lastSeen.Store(time.Now().UnixNano())
 }
 
 // SetSpeedLimitFunc configures the per-user speed limit lookup.
@@ -236,17 +254,17 @@ func (t *ConnTracker) RoutedConnection(
 
 	connID := t.nextID()
 
-	// Store conn reference for force-close support
-	t.usersMu.Lock()
-	t.connMap[connID] = conn
-	t.usersMu.Unlock()
+	// Store a placeholder for force-close support and the idle janitor. The
+	// wrapper is assigned below so closing it also cleans up per-user state.
+	entry := &trackedEntry{}
+	entry.touch()
 
 	var lim *rate.Limiter
 	if slf := t.speedLimitFunc.Load(); slf != nil {
 		lim = (*slf)(uuid)
 	}
 
-	return &trackedConn{
+	tc := &trackedConn{
 		Conn:     conn,
 		tracker:  t,
 		us:       us,
@@ -254,8 +272,14 @@ func (t *ConnTracker) RoutedConnection(
 		connID:   connID,
 		sourceIP: sourceIP,
 		limiter:  lim,
+		entry:    entry,
 		ctx:      ctx,
 	}
+	entry.conn = tc
+	t.usersMu.Lock()
+	t.connMap[connID] = entry
+	t.usersMu.Unlock()
+	return tc
 }
 
 // RoutedPacketConnection wraps UDP with per-user counting (UDP not in connMap).
@@ -443,15 +467,63 @@ func (t *ConnTracker) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[i
 // CloseByID force-closes a connection by its ID.
 func (t *ConnTracker) CloseByID(id string) bool {
 	t.usersMu.RLock()
-	conn, ok := t.connMap[id]
+	entry, ok := t.connMap[id]
 	t.usersMu.RUnlock()
 	if !ok {
 		return false
 	}
-	if conn != nil {
-		conn.Close()
+	if entry != nil && entry.conn != nil {
+		entry.conn.Close()
 	}
 	return true
+}
+
+// runIdleJanitor periodically closes TCP connections that have been idle
+// longer than idleTimeout. It runs until ctx is cancelled (instance shutdown).
+func (t *ConnTracker) runIdleJanitor(ctx context.Context) {
+	if t.idleTimeout <= 0 {
+		return
+	}
+
+	interval := t.idleTimeout / 4
+	if interval < 2*time.Second {
+		interval = 2 * time.Second
+	}
+	if interval > 10*time.Second {
+		interval = 10 * time.Second
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			t.closeIdleConns()
+		}
+	}
+}
+
+// closeIdleConns closes TCP connections whose last activity is older than
+// idleTimeout. UDP/QUIC connections are intentionally not tracked here.
+func (t *ConnTracker) closeIdleConns() {
+	cutoff := time.Now().Add(-t.idleTimeout).UnixNano()
+
+	var stale []net.Conn
+	t.usersMu.RLock()
+	for _, entry := range t.connMap {
+		if entry != nil && entry.conn != nil && entry.lastSeen.Load() <= cutoff {
+			stale = append(stale, entry.conn)
+		}
+	}
+	t.usersMu.RUnlock()
+
+	for _, conn := range stale {
+		// Close is idempotent; the trackedConn.Close wrapper cleans up the
+		// per-user IP refcount and removes the connMap entry.
+		_ = conn.Close()
+	}
 }
 
 // CloseByUUID force-closes ALL connections for a given user UUID.
@@ -565,11 +637,15 @@ type trackedConn struct {
 	connID   string
 	sourceIP string
 	limiter  *rate.Limiter
+	entry    *trackedEntry // nil for connections created before the idle janitor existed
 	ctx      context.Context
 	closed   atomic.Bool
 }
 
 func (c *trackedConn) Read(b []byte) (int, error) {
+	if c.entry != nil {
+		c.entry.touch()
+	}
 	if c.limiter != nil {
 		if burst := c.limiter.Burst(); len(b) > burst {
 			b = b[:burst]
@@ -602,6 +678,9 @@ func (c *trackedConn) Read(b []byte) (int, error) {
 }
 
 func (c *trackedConn) Write(b []byte) (int, error) {
+	if c.entry != nil {
+		c.entry.touch()
+	}
 	// Apply rate limiting before write
 	if c.limiter != nil {
 		if burst := c.limiter.Burst(); len(b) > burst {
@@ -644,11 +723,21 @@ func (c *trackedConn) Close() error {
 // makeCountFunc builds a CountFunc for zero-copy byte counting via sing's
 // ReadCounter/WriteCounter unwrap interfaces.
 func (c *trackedConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {
+	// sing-box may bypass Read/Write via UnwrapReader/UnwrapWriter, so the
+	// idle timer must also be refreshed from the CountFunc data path.
 	if c.limiter == nil {
-		return func(n int64) { counter.Add(n) }
+		return func(n int64) {
+			counter.Add(n)
+			if c.entry != nil {
+				c.entry.touch()
+			}
+		}
 	}
 	return func(n int64) {
 		counter.Add(n)
+		if c.entry != nil {
+			c.entry.touch()
+		}
 		// Non-blocking rate limiting with context cancellation
 		if !c.limiter.AllowN(time.Now(), int(n)) {
 			resv := c.limiter.ReserveN(time.Now(), int(n))

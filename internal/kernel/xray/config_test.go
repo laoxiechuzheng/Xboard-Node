@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -430,6 +432,70 @@ func TestBuildConfig_StatsEnabled(t *testing.T) {
 	}
 	if v, ok := level0["statsUserDownlink"]; !ok || v != true {
 		t.Error("statsUserDownlink not enabled")
+	}
+}
+
+func TestBuildConfig_PolicyDefaults(t *testing.T) {
+	nc := panel.NodeConfig{
+		Protocol:   "vmess",
+		ServerPort: 10086,
+	}
+	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	data, _ := json.Marshal(cfg)
+
+	var parsed map[string]interface{}
+	json.Unmarshal(data, &parsed)
+
+	policy := parsed["policy"].(map[string]interface{})
+	levels := policy["levels"].(map[string]interface{})
+	level0 := levels["0"].(map[string]interface{})
+
+	want := map[string]float64{
+		"handshake":    4,
+		"connIdle":     35,
+		"uplinkOnly":   3,
+		"downlinkOnly": 5,
+		"bufferSize":   128,
+	}
+	for k, v := range want {
+		if got, ok := level0[k]; !ok || got != v {
+			t.Errorf("policy %s = %v, want %v", k, got, v)
+		}
+	}
+}
+
+func TestBuildConfig_CustomPolicyOverrides(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "custom.json")
+	if err := os.WriteFile(path, []byte(`{"policy":{"levels":{"0":{"connIdle":20,"bufferSize":64}}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	kcfg := config.KernelConfig{Type: "xray", CustomConfig: path}
+	nc := panel.NodeConfig{
+		Protocol:   "vmess",
+		ServerPort: 10086,
+	}
+	cfg := buildConfig(kcfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	data, _ := json.Marshal(cfg)
+
+	var parsed map[string]interface{}
+	json.Unmarshal(data, &parsed)
+
+	policy := parsed["policy"].(map[string]interface{})
+	levels := policy["levels"].(map[string]interface{})
+	level0 := levels["0"].(map[string]interface{})
+
+	if got := level0["connIdle"]; got != float64(20) {
+		t.Errorf("custom connIdle = %v, want 20", got)
+	}
+	if got := level0["bufferSize"]; got != float64(64) {
+		t.Errorf("custom bufferSize = %v, want 64", got)
+	}
+	if got := level0["handshake"]; got != float64(4) {
+		t.Errorf("default handshake lost after merge = %v, want 4", got)
+	}
+	if v, ok := level0["statsUserUplink"]; !ok || v != true {
+		t.Errorf("statsUserUplink lost after merge: %v", v)
 	}
 }
 

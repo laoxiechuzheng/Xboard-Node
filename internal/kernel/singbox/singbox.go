@@ -140,7 +140,7 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.tls = tls
 
 	// Fresh tracker on full restart.
-	s.connTracker = NewConnTracker(0)
+	s.connTracker = NewConnTracker(idleTimeoutFromConfig(s.cfg))
 	s.connTracker.SetUserMap(buildUserMap(users))
 	if s.speedLimitFunc != nil {
 		s.connTracker.SetSpeedLimitFunc(s.speedLimitFunc)
@@ -151,6 +151,8 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 
 	s.trackerRegistered = false
 	s.registerTracker(ctx)
+	// Idle janitor lives for the lifetime of this instance context.
+	go s.connTracker.runIdleJanitor(ctx)
 
 	// Recycle old instance in background — drain then close.
 	if oldBox != nil {
@@ -159,6 +161,22 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 
 	nlog.Core().Debug("sing-box started", "users", len(users))
 	return nil
+}
+
+// defaultSingboxIdleTimeout is the sing-box equivalent of xray's connIdle.
+const defaultSingboxIdleTimeout = 35
+
+// idleTimeoutFromConfig resolves the singbox TCP idle timeout from config:
+// 0 = default (35s), negative = disabled, positive = explicit seconds.
+func idleTimeoutFromConfig(cfg config.KernelConfig) time.Duration {
+	t := cfg.IdleTimeout
+	if t == 0 {
+		t = defaultSingboxIdleTimeout
+	}
+	if t < 0 {
+		return 0
+	}
+	return time.Duration(t) * time.Second
 }
 
 // recycleOldBox gracefully shuts down a previous sing-box instance in the

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand/v2"
 	"sort"
 	"strings"
 	"sync"
@@ -218,10 +219,10 @@ func (s *Service) Run(ctx context.Context) error {
 			s.reportDevices()
 
 		case <-pullTicker.C:
-    // Poll even when WebSocket is connected. WS push gives low latency, while
-    // ETag-backed REST polling repairs any missed user/config events.
-    nlog.Core().Debug("polling from API")
-    s.pullViaAPIAsync(ctx)
+			// Poll even when WebSocket is connected. WS push gives low latency, while
+			// ETag-backed REST polling repairs any missed user/config events.
+			nlog.Core().Debug("polling from API")
+			s.pullViaAPIAsync(ctx)
 
 		case result := <-s.pullResults:
 			s.applyPullResult(ctx, result)
@@ -426,7 +427,32 @@ func (s *Service) requestWSResync(ctx context.Context, reason string) {
 	} else {
 		nlog.Core().Warn("ws state may be stale, scheduling REST reconciliation", "reason", reason)
 	}
-	s.pullViaAPIAsync(ctx)
+	s.schedulePullAsync(ctx, wsPullJitter)
+}
+
+// wsPullJitter spreads REST reconciliation pulls after WS events across a few
+// seconds. Without it, every node service that reconnects at the same moment
+// hits the panel API simultaneously, causing CPU/traffic spikes.
+const wsPullJitter = 5 * time.Second
+
+// schedulePullAsync runs pullViaAPIAsync after a random delay in
+// [0, maxJitter]. A zero maxJitter pulls immediately.
+func (s *Service) schedulePullAsync(ctx context.Context, maxJitter time.Duration) {
+	if maxJitter <= 0 {
+		s.pullViaAPIAsync(ctx)
+		return
+	}
+	delay := time.Duration(rand.Int64N(int64(maxJitter) + 1))
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			return
+		}
+		s.pullViaAPIAsync(ctx)
+	}()
 }
 
 func (s *Service) wsMetrics() map[string]interface{} {
@@ -456,7 +482,7 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 		}
 		// After reconnect, proactively pull once to ensure we haven't missed
 		// any updates during the disconnection window.
-		s.pullViaAPIAsync(ctx)
+		s.schedulePullAsync(ctx, wsPullJitter)
 	} else {
 		s.metricsMu.Lock()
 		if s.wsDisconnectAt.IsZero() {
@@ -470,7 +496,7 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 		}
 		// Clear global device state on disconnect
 		s.kernel.ClearGlobalDevices()
-		s.pullViaAPIAsync(ctx)
+		s.schedulePullAsync(ctx, wsPullJitter)
 	}
 }
 

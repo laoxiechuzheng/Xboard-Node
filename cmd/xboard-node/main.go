@@ -152,11 +152,25 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		errCh := make(chan error, len(instances))
 		doneCh := make(chan struct{})
 		var wg sync.WaitGroup
-		for _, instanceCfg := range instances {
+		for idx, instanceCfg := range instances {
 			instanceCfg := instanceCfg
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				// Cross-instance startup stagger: without this every
+				// instance's periodic tasks (track/push/status) start at the
+				// same wall-clock phase and align, causing CPU spikes.
+				if idx > 0 {
+					delay := time.Duration(idx) * 800 * time.Millisecond
+					if delay > 3*time.Second {
+						delay = 3 * time.Second
+					}
+					select {
+					case <-time.After(delay):
+					case <-ctx.Done():
+						return
+					}
+				}
 				if instanceCfg.IsMachineMode() {
 					nlog.Core().Info("starting machine instance", "instance", instanceCfg.InstanceID, "machine_id", instanceCfg.Machine.MachineID, "panel_url", instanceCfg.Panel.URL)
 					orch := machine.New(instanceCfg)
