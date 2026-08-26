@@ -49,7 +49,7 @@ func main() {
 	config.InitLogger(instances[0].Log)
 
 	// Apply runtime memory tuning before anything else allocates.
-	applyRuntimeConfig(instances[0].Runtime, instances[0].Kernel.Type)
+	applyRuntimeConfig(instances[0].Runtime)
 
 	runWithReload(rootCfg, *configPath)
 }
@@ -242,26 +242,18 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 			os.Exit(1)
 		}
 		config.InitLogger(newInstances[0].Log)
-		applyRuntimeConfig(newInstances[0].Runtime, newInstances[0].Kernel.Type)
+		applyRuntimeConfig(newInstances[0].Runtime)
 		root = newRoot
 		nlog.Core().Info("reload complete, services restarting with new config")
 	}
 }
-
-// defaultSingboxGoMemLimit is applied only when the config does not set
-// runtime.gomemlimit and GOMEMLIMIT env is unset. sing-box holds a much
-// larger Go runtime headroom than xray under load, so a conservative soft
-// default keeps resident memory bounded. This is a soft limit: GC becomes
-// more aggressive above it, never an OOM kill. Override via runtime.gomemlimit
-// (set 0 to disable is not supported; omit for xray).
-const defaultSingboxGoMemLimit = "384MiB"
 
 // applyRuntimeConfig wires up Go runtime memory limits from the config file.
 // Both settings can also be overridden by environment variables (GOMEMLIMIT /
 // GOGC) — the env vars take precedence because Go's runtime reads them before
 // we can call these functions, but we set them here for completeness and so
 // the values are logged.
-func applyRuntimeConfig(rt config.RuntimeConfig, kernelType string) {
+func applyRuntimeConfig(rt config.RuntimeConfig) {
 	// GOGC
 	if rt.GoGCPercent > 0 {
 		prev := debug.SetGCPercent(rt.GoGCPercent)
@@ -269,10 +261,11 @@ func applyRuntimeConfig(rt config.RuntimeConfig, kernelType string) {
 	}
 
 	// GOMEMLIMIT — parse human-readable size string (e.g. "30MiB").
+	// Applied only when explicitly configured. The previous implicit
+	// 384MiB default for singbox caused GC thrash whenever the live heap
+	// outgrew the soft limit under load, so it was removed: when unset the
+	// Go runtime sizes the heap naturally instead of chasing a fixed cap.
 	limitStr := rt.GoMemLimit
-	if limitStr == "" && strings.EqualFold(kernelType, "singbox") && os.Getenv("GOMEMLIMIT") == "" {
-		limitStr = defaultSingboxGoMemLimit
-	}
 	if limitStr != "" {
 		limit, err := parseMemLimit(limitStr)
 		if err != nil {

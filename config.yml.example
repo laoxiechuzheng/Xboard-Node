@@ -33,8 +33,7 @@
 # log:
 #   level: "none"      # disable xboard-node application logs
 # runtime:
-#   # singbox default: 384MiB soft cap is applied when gomemlimit is omitted
-#   # (xray: no default). Lower = less RSS, slightly more GC CPU.
+#   # Lower = less RSS, slightly more GC CPU. Omitted = no soft cap.
 #   gomemlimit: "600MiB"  # soft RSS cap; GC becomes aggressive above this
 #   gogc: 70              # lower = less memory, more GC CPU (default 100)
 # instances:
