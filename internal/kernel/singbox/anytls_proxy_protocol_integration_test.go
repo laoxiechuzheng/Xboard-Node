@@ -125,15 +125,24 @@ func TestAnyTLSForceProxyProtocolTracksRealClient(t *testing.T) {
 			if string(response[:]) != "ping" {
 				t.Fatalf("echo = %q, want ping", response)
 			}
-			traffic, alive, count, err := instance.GetUserTraffic(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if count != 1 || len(alive[user.ID]) != 1 || !alive[user.ID][test.wantIP] {
-				t.Fatalf("tracked source: count=%d alive=%v, want %s", count, alive, test.wantIP)
-			}
-			if traffic[user.ID][0] < 4 || traffic[user.ID][1] < 4 {
-				t.Fatalf("authenticated stream was not metered: %v", traffic)
+			// Receiving the echo can precede the server's byte-count callbacks.
+			pollCtx, pollCancel := context.WithTimeout(ctx, 2*time.Second)
+			defer pollCancel()
+			ticker := time.NewTicker(5 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				traffic, alive, count, err := instance.GetUserTraffic(pollCtx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if count == 1 && len(alive[user.ID]) == 1 && alive[user.ID][test.wantIP] && traffic[user.ID][0] >= 4 && traffic[user.ID][1] >= 4 {
+					break
+				}
+				select {
+				case <-pollCtx.Done():
+					t.Fatalf("tracked traffic did not settle: count=%d alive=%v traffic=%v, want %s", count, alive, traffic, test.wantIP)
+				case <-ticker.C:
+				}
 			}
 		})
 	}
