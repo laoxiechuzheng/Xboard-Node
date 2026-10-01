@@ -3,6 +3,7 @@ package singbox
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -45,6 +46,13 @@ type SingBox struct {
 	nodeConfig *model.NodeSpec
 	tls        kernel.TLSCert
 
+	// The pinned HY2 inbound authenticates QUIC sessions by array index. Keep
+	// these slots stable until a full inbound reconstruction or restart.
+	hysteria2Users []option.Hysteria2User
+
+	// TUIC authenticates sessions by array index too, so it gets the same slots.
+	tuicUsers []option.TUICUser
+
 	// connTracker is our lightweight in-process byte/IP tracker.
 	// Created fresh on every Start (full restart).
 	// Survives Reload (hot-swap) since live connections persist.
@@ -57,10 +65,6 @@ type SingBox struct {
 	// deviceLimitFunc resolves a user UUID to (limit, hasLimit) for gate-keeping.
 	// Set once by SetDeviceLimitFunc and forwarded to every new ConnTracker.
 	deviceLimitFunc func(string) (int, bool)
-
-	// trackerRegistered prevents duplicate AppendTracker calls on the same
-	// Router instance during Reload. Reset to false on full restart.
-	trackerRegistered bool
 }
 
 func New(cfg config.KernelConfig) *SingBox {
@@ -85,7 +89,7 @@ func (s *SingBox) Capabilities() kernel.Capabilities {
 func (s *SingBox) Protocols() []string {
 	return []string{
 		"vmess", "vless", "trojan", "shadowsocks",
-		"hysteria", "hysteria2", "tuic", "naive", "socks", "http", "anytls", "mieru",
+		"hysteria", "hysteria2", "hy2", "tuic", "naive", "socks", "http", "anytls", "mieru",
 	}
 }
 
@@ -125,6 +129,23 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 		return fmt.Errorf("create sing-box instance: %w", err)
 	}
 
+	tracker := NewConnTracker(idleTimeoutFromConfig(s.cfg))
+	tracker.SetUserMap(buildUserMap(users))
+	tracker.SetAuditSink(s.cfg.AuditSink, nodeConfig.NodeID, inboundProtocol(nodeConfig))
+	if s.speedLimitFunc != nil {
+		tracker.SetSpeedLimitFunc(s.speedLimitFunc)
+	}
+	if s.deviceLimitFunc != nil {
+		tracker.SetDeviceLimitFunc(s.deviceLimitFunc)
+	}
+	router := service.FromContext[adapter.Router](ctx)
+	if router == nil {
+		instance.Close()
+		cancel()
+		return fmt.Errorf("sing-box router not available")
+	}
+	router.AppendTracker(tracker)
+
 	if err := instance.Start(); err != nil {
 		instance.Close()
 		cancel()
@@ -138,21 +159,19 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.users = users
 	s.nodeConfig = nodeConfig
 	s.tls = tls
-
-	// Fresh tracker on full restart.
-	s.connTracker = NewConnTracker(idleTimeoutFromConfig(s.cfg))
-	s.connTracker.SetUserMap(buildUserMap(users))
-	if s.speedLimitFunc != nil {
-		s.connTracker.SetSpeedLimitFunc(s.speedLimitFunc)
+	s.connTracker = tracker
+	s.hysteria2Users = nil
+	s.tuicUsers = nil
+	for _, inb := range opts.Inbounds {
+		if options, ok := inb.Options.(*option.Hysteria2InboundOptions); ok {
+			s.hysteria2Users = append([]option.Hysteria2User(nil), options.Users...)
+		}
+		if options, ok := inb.Options.(*option.TUICInboundOptions); ok {
+			s.tuicUsers = append([]option.TUICUser(nil), options.Users...)
+		}
 	}
-	if s.deviceLimitFunc != nil {
-		s.connTracker.SetDeviceLimitFunc(s.deviceLimitFunc)
-	}
-
-	s.trackerRegistered = false
-	s.registerTracker(ctx)
 	// Idle janitor lives for the lifetime of this instance context.
-	go s.connTracker.runIdleJanitor(ctx)
+	go tracker.runIdleJanitor(ctx)
 
 	// Recycle old instance in background — drain then close.
 	if oldBox != nil {
@@ -250,7 +269,21 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 
 	// Configuration hash check for inbound reconstruction
 	tlsChanged := !bytes.Equal(s.tls.CertPEM, tls.CertPEM) || !bytes.Equal(s.tls.KeyPEM, tls.KeyPEM)
-	configChanged := tlsChanged || s.nodeConfig == nil || kernel.ComputeHash(nodeConfig, users) != kernel.ComputeHash(s.nodeConfig, s.users)
+	configUsers, previousConfigUsers := users, s.users
+	if p := inboundProtocol(nodeConfig); p == "hysteria2" || p == "tuic" {
+		// HY2 and TUIC credentials are updated in stable slots without rebinding QUIC.
+		configUsers, previousConfigUsers = nil, nil
+	}
+	configChanged := tlsChanged || s.nodeConfig == nil || kernel.ComputeHash(nodeConfig, configUsers) != kernel.ComputeHash(s.nodeConfig, previousConfigUsers)
+
+	// Trackers remain registered on the Router (which survives ReloadUsers).
+	// Only update the user map — do NOT re-register or traffic is double-counted.
+	// Publish it before the inbounds change: a HY2 session of a just-added user
+	// is closed by the tracker when its user is not in the map yet.
+	if s.connTracker != nil {
+		s.connTracker.SetUserMap(buildUserMap(users))
+		s.connTracker.SetAuditSink(s.cfg.AuditSink, nodeConfig.NodeID, inboundProtocol(nodeConfig))
+	}
 
 	for _, inb := range opts.Inbounds {
 		tag := inb.Tag
@@ -272,7 +305,11 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 					}
 				case adapter.UpdatableInbound[option.Hysteria2User]:
 					if opts, ok := inb.Options.(*option.Hysteria2InboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
+						slots := stableHysteria2Users(s.hysteria2Users, opts.Users)
+						err = v.UpdateUsers(slots)
+						if err == nil {
+							s.hysteria2Users = slots
+						}
 					}
 				case adapter.UpdatableShadowsocksInbound:
 					if opts, ok := inb.Options.(*option.ShadowsocksInboundOptions); ok {
@@ -280,7 +317,11 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 					}
 				case adapter.UpdatableInbound[option.TUICUser]:
 					if opts, ok := inb.Options.(*option.TUICInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
+						slots := stableTUICUsers(s.tuicUsers, opts.Users)
+						err = v.UpdateUsers(slots)
+						if err == nil {
+							s.tuicUsers = slots
+						}
 					}
 				case adapter.UpdatableInbound[option.AnyTLSUser]:
 					if opts, ok := inb.Options.(*option.AnyTLSInboundOptions); ok {
@@ -317,12 +358,14 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 		if err := im.Create(s.ctx, router, logger, tag, inb.Type, inb.Options); err != nil {
 			return fmt.Errorf("recreate inbound %s: %w", tag, err)
 		}
-	}
-
-	// Trackers remain registered on the Router (which survives ReloadUsers).
-	// Only update the user map — do NOT re-register or traffic is double-counted.
-	if s.connTracker != nil {
-		s.connTracker.SetUserMap(buildUserMap(users))
+		s.hysteria2Users = nil
+		if options, ok := inb.Options.(*option.Hysteria2InboundOptions); ok {
+			s.hysteria2Users = append([]option.Hysteria2User(nil), options.Users...)
+		}
+		s.tuicUsers = nil
+		if options, ok := inb.Options.(*option.TUICInboundOptions); ok {
+			s.tuicUsers = append([]option.TUICUser(nil), options.Users...)
+		}
 	}
 
 	nlog.Core().Debug("sing-box reloaded", "users", len(users))
@@ -330,23 +373,6 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 	s.nodeConfig = nodeConfig
 	s.tls = tls
 	return nil
-}
-
-// registerTracker wires the ConnTracker to the current Router exactly once.
-// The ConnTracker handles both byte counting and optional rate limiting
-// in a single wrapper, so no additional trackers are needed.
-func (s *SingBox) registerTracker(ctx context.Context) {
-	if s.trackerRegistered {
-		return
-	}
-	router := service.FromContext[adapter.Router](ctx)
-	if router == nil {
-		return
-	}
-	if s.connTracker != nil {
-		router.AppendTracker(s.connTracker)
-	}
-	s.trackerRegistered = true
 }
 
 func (s *SingBox) Stop() {
@@ -525,6 +551,7 @@ func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err e
 		// Only limits may have changed — update tracker map.
 		if s.connTracker != nil {
 			s.connTracker.SetUserMap(buildUserMap(users))
+			s.connTracker.SetAuditSink(s.cfg.AuditSink, s.nodeConfig.NodeID, inboundProtocol(s.nodeConfig))
 		}
 		s.users = users
 		return 0, 0, nil
@@ -563,6 +590,13 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 
 	nopFactory := singLog.NewNOPFactory()
 
+	// Publish the user map before the inbounds change so a HY2 session of a
+	// just-added user is not closed by the tracker as unknown.
+	if s.connTracker != nil {
+		s.connTracker.SetUserMap(buildUserMap(users))
+		s.connTracker.SetAuditSink(s.cfg.AuditSink, s.nodeConfig.NodeID, inboundProtocol(s.nodeConfig))
+	}
+
 	for _, inb := range opts.Inbounds {
 		tag := inb.Tag
 		if existing, ok := im.Get(tag); ok && existing.Type() == inb.Type {
@@ -582,7 +616,11 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 				}
 			case adapter.UpdatableInbound[option.Hysteria2User]:
 				if opts, ok := inb.Options.(*option.Hysteria2InboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
+					slots := stableHysteria2Users(s.hysteria2Users, opts.Users)
+					err = v.UpdateUsers(slots)
+					if err == nil {
+						s.hysteria2Users = slots
+					}
 				}
 			case adapter.UpdatableShadowsocksInbound:
 				if opts, ok := inb.Options.(*option.ShadowsocksInboundOptions); ok {
@@ -590,7 +628,11 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 				}
 			case adapter.UpdatableInbound[option.TUICUser]:
 				if opts, ok := inb.Options.(*option.TUICInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
+					slots := stableTUICUsers(s.tuicUsers, opts.Users)
+					err = v.UpdateUsers(slots)
+					if err == nil {
+						s.tuicUsers = slots
+					}
 				}
 			case adapter.UpdatableInbound[option.AnyTLSUser]:
 				if opts, ok := inb.Options.(*option.AnyTLSInboundOptions); ok {
@@ -621,10 +663,14 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 		if err := im.Create(s.ctx, router, logger, tag, inb.Type, inb.Options); err != nil {
 			return fmt.Errorf("recreate inbound %s: %w", tag, err)
 		}
-	}
-
-	if s.connTracker != nil {
-		s.connTracker.SetUserMap(buildUserMap(users))
+		s.hysteria2Users = nil
+		if options, ok := inb.Options.(*option.Hysteria2InboundOptions); ok {
+			s.hysteria2Users = append([]option.Hysteria2User(nil), options.Users...)
+		}
+		s.tuicUsers = nil
+		if options, ok := inb.Options.(*option.TUICInboundOptions); ok {
+			s.tuicUsers = append([]option.TUICUser(nil), options.Users...)
+		}
 	}
 
 	nlog.Core().Debug("sing-box users hot-swapped", "users", len(users))
@@ -669,7 +715,74 @@ func (s *SingBox) CloseUserConnections(_ context.Context, uuid string) error {
 func buildUserMap(users []model.UserSpec) map[string]int {
 	m := make(map[string]int, len(users))
 	for _, u := range users {
+		if u.UUID == "" || u.ID <= 0 {
+			continue
+		}
+		if uid, exists := m[u.UUID]; exists && uid != u.ID {
+			m[u.UUID] = 0
+			continue
+		}
 		m[u.UUID] = u.ID
 	}
 	return m
+}
+
+// stableTUICUsers is the TUIC counterpart of stableHysteria2Users: a removed
+// user keeps its slot with a random UUID and password that no client can
+// present, so a live session's index never resolves to another account.
+func stableTUICUsers(previous, users []option.TUICUser) []option.TUICUser {
+	active := make(map[string]option.TUICUser, len(users))
+	for _, user := range users {
+		active[user.Name] = user
+	}
+	slots := make([]option.TUICUser, 0, len(previous)+len(users))
+	for _, old := range previous {
+		if user, exists := active[old.Name]; exists {
+			slots = append(slots, user)
+			delete(active, old.Name)
+		} else {
+			slots = append(slots, option.TUICUser{Name: old.Name, UUID: randomUUID(), Password: rand.Text()})
+		}
+	}
+	for _, user := range users {
+		if _, exists := active[user.Name]; exists {
+			slots = append(slots, user)
+			delete(active, user.Name)
+		}
+	}
+	return slots
+}
+
+// randomUUID returns a random version 4 UUID string.
+func randomUUID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+}
+
+func stableHysteria2Users(previous, users []option.Hysteria2User) []option.Hysteria2User {
+	active := make(map[string]option.Hysteria2User, len(users))
+	for _, user := range users {
+		active[user.Name] = user
+	}
+	slots := make([]option.Hysteria2User, 0, len(previous)+len(users))
+	for _, old := range previous {
+		if user, exists := active[old.Name]; exists {
+			slots = append(slots, user)
+			delete(active, old.Name)
+		} else {
+			// Never compact or reuse an index while its QUIC session may live.
+			// An empty password would enable anonymous HY2 authentication.
+			slots = append(slots, option.Hysteria2User{Name: old.Name, Password: rand.Text()})
+		}
+	}
+	for _, user := range users {
+		if _, exists := active[user.Name]; exists {
+			slots = append(slots, user)
+			delete(active, user.Name)
+		}
+	}
+	return slots
 }

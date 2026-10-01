@@ -68,7 +68,33 @@ kernel:
   log_level: "none"
 ```
 
-`log.level: none` disables xboard-node application logs without creating `log.output`. `kernel.log_level: none` disables xray/sing-box core logs and prevents the xray audit log from being opened. Startup failures before the configuration is loaded and Go runtime panics may still be written directly to stderr.
+`log.level: none` disables xboard-node application logs without creating `log.output`. `kernel.log_level: none` disables xray/sing-box core logs. Startup failures before the configuration is loaded and Go runtime panics may still be written directly to stderr.
+
+### Connection audit (Flux)
+
+xboard-node can report every accepted connection (site, user ID, UUID, node ID, client IP, destination, core, protocol,
+TCP/UDP) to a Flux audit endpoint. Both cores are covered, including sing-box Hysteria2 (`hy2` is reported as
+`hysteria2`; QUIC handshakes and keepalives are not events). No traffic payload is collected.
+
+Enable it by adding two lines to the top level of `config.yml`; every `instances[]` entry inherits them:
+
+```yaml
+audit:
+  url: "https://flux.yihetang.icu/api/node-audit/v2/ingest"
+  secret: "flux-ingest-secret"  # or secret_env: "AUDIT_SECRET"
+```
+
+Each instance reports under its panel domain (for example `98kjc.top`), and Flux maps panel domains to its site keys,
+so one process can serve several panels. Set `audit.site` on an instance only to override that. Optional settings:
+`agent_id` (default: hostname), `queue_size` (default 16384) and `batch_size` (default 512). `AUDIT_URL`,
+`AUDIT_SITE`, `AUDIT_SECRET` and `AUDIT_AGENT_ID` override the top-level values. Different machines may report the
+same UUIDs: Flux keeps events apart by site, user, node, agent and process instance.
+
+Nothing is written to the node's disk and forwarding never waits on the upload. Events wait in a bounded in-memory queue
+shared by the whole process and leave in gzip batches over HTTPS, authenticated with HMAC-SHA256. A failed upload keeps
+its batch in memory and retries it with backoff (1 s up to 30 s) until Flux acknowledges it; shutdown flushes for up to
+5 seconds. Only an outage longer than the queue can absorb, or a crash, loses events, and those losses are counted and
+shown in Flux. `kernel.audit_log` is deprecated and no longer writes a file.
 
 ## Extensions
 

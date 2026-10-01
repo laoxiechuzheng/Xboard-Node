@@ -439,8 +439,9 @@ func mergeCustomSingboxRoute(cfg M, customRoute map[string]any) {
 // variadic so existing tests that call buildInbound without a kernel config
 // keep compiling.
 func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert, kcfgs ...config.KernelConfig) M {
+	protocol := inboundProtocol(nc)
 	base := M{
-		"tag":         nc.Protocol + "-in",
+		"tag":         protocol + "-in",
 		"listen":      "::",
 		"listen_port": nc.ServerPort,
 	}
@@ -458,7 +459,7 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert,
 		}
 	}
 
-	switch nc.Protocol {
+	switch protocol {
 	case "shadowsocks":
 		return buildShadowsocks(base, nc, users)
 	case "vmess":
@@ -467,7 +468,7 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert,
 		return buildVLESS(base, nc, users, tc)
 	case "trojan":
 		return buildTrojan(base, nc, users, tc)
-	case "hysteria":
+	case "hysteria", "hysteria2":
 		return buildHysteria(base, nc, users, tc)
 	case "tuic":
 		return buildTUIC(base, nc, users, tc)
@@ -484,6 +485,18 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert,
 	default:
 		return nil
 	}
+}
+
+func inboundProtocol(nc *model.NodeSpec) string {
+	switch nc.Protocol {
+	case "hysteria":
+		if nc.Version == 2 {
+			return "hysteria2"
+		}
+	case "hysteria2", "hy2":
+		return "hysteria2"
+	}
+	return nc.Protocol
 }
 
 func buildMieru(base M, nc *model.NodeSpec, users []model.UserSpec) M {
@@ -659,7 +672,7 @@ func buildTrojan(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.T
 }
 
 func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
-	if nc.Version == 2 {
+	if inboundProtocol(nc) == "hysteria2" {
 		base["type"] = "hysteria2"
 
 		userList := make([]M, 0, len(users))

@@ -24,7 +24,9 @@ build-all: build-linux build-linux-arm64
 
 # Run tests
 test:
-	go test -v -race -count=1 ./internal/...
+	go test -v -race -count=1 $$(go list ./internal/... | grep -v '/internal/kernel/singbox$$')
+	# The sing-box package also runs its Hysteria2 QUIC tests, which need with_quic.
+	go test -v -race -count=1 -tags with_quic ./internal/kernel/singbox
 
 # Clean build artifacts
 clean:

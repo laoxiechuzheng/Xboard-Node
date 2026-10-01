@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cedar2025/xboard-node/internal/audit"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
@@ -26,6 +27,7 @@ type Config struct {
 	Cert       CertConfig    `yaml:"cert"`
 	Log        LogConfig     `yaml:"log"`
 	Runtime    RuntimeConfig `yaml:"runtime"`
+	Audit      AuditConfig   `yaml:"audit"`
 	WS         WSConfig      `yaml:"ws"`
 	// Standalone enables a local-only node that never contacts the panel.
 	Standalone *StandaloneConfig `yaml:"standalone,omitempty"`
@@ -42,6 +44,16 @@ type Config struct {
 	// via GET /api/v2/server/machine/nodes. When set, Panel.NodeID, Nodes
 	// and Panel.Token are ignored; the machine token is used instead.
 	Machine *MachineConfig `yaml:"machine,omitempty"`
+}
+
+type AuditConfig struct {
+	URL       string `yaml:"url"`
+	Site      string `yaml:"site"`
+	Secret    string `yaml:"secret,omitempty"`
+	SecretEnv string `yaml:"secret_env,omitempty"`
+	AgentID   string `yaml:"agent_id,omitempty"`
+	QueueSize int    `yaml:"queue_size,omitempty"`
+	BatchSize int    `yaml:"batch_size,omitempty"`
 }
 
 // MachineConfig identifies this process as a panel-managed machine that
@@ -119,11 +131,12 @@ type WSConfig struct {
 }
 
 type KernelConfig struct {
-	Type               string `yaml:"type"` // "singbox" or "xray"
-	ConfigDir          string `yaml:"config_dir"`
-	LogLevel           string `yaml:"log_level"`
-	AuditLog           string `yaml:"audit_log"`
-	ForceProxyProtocol bool   `yaml:"force_proxy_protocol"`
+	Type               string     `yaml:"type"` // "singbox" or "xray"
+	ConfigDir          string     `yaml:"config_dir"`
+	LogLevel           string     `yaml:"log_level"`
+	AuditLog           string     `yaml:"audit_log"` // Deprecated: parsed for compatibility but never written locally.
+	AuditSink          audit.Sink `yaml:"-"`
+	ForceProxyProtocol bool       `yaml:"force_proxy_protocol"`
 
 	// DeviceLimitEnforce enables admission enforcement when a user exceeds
 	// their device limit. When false (the default), device IPs are still
@@ -251,6 +264,10 @@ func LoadRoot(path string) (*RootConfig, error) {
 	// serve as defaults that each instance inherits. Instance-level settings
 	// take precedence over top-level ones.
 	if len(rc.Instances) > 0 {
+		// AUDIT_* variables are defaults like the rest of the top level: apply
+		// them before inheritance so an instance that sets its own audit
+		// fields (for example a different audit.site) keeps them.
+		rc.Config.applyAuditEnvOverrides()
 		for i := range rc.Instances {
 			rc.Instances[i].inheritFrom(&rc.Config)
 		}
@@ -288,7 +305,7 @@ func (rc *RootConfig) applyEnvOverrides() {
 		return
 	}
 	for i := range rc.Instances {
-		rc.Instances[i].applyEnvOverrides()
+		rc.Instances[i].applyNodeEnvOverrides()
 	}
 }
 
@@ -430,6 +447,26 @@ func envFirst(names ...string) string {
 }
 
 func (c *Config) applyEnvOverrides() {
+	c.applyAuditEnvOverrides()
+	c.applyNodeEnvOverrides()
+}
+
+func (c *Config) applyAuditEnvOverrides() {
+	if v := envFirst("AUDIT_URL"); v != "" {
+		c.Audit.URL = v
+	}
+	if v := envFirst("AUDIT_SITE"); v != "" {
+		c.Audit.Site = v
+	}
+	if v := envFirst("AUDIT_SECRET"); v != "" {
+		c.Audit.Secret = v
+	}
+	if v := envFirst("AUDIT_AGENT_ID"); v != "" {
+		c.Audit.AgentID = v
+	}
+}
+
+func (c *Config) applyNodeEnvOverrides() {
 	if v := envFirst("apiHost", "API_HOST"); v != "" {
 		c.Panel.URL = v
 	}
@@ -477,6 +514,9 @@ func (c *Config) applyEnvOverrides() {
 }
 
 func (c *Config) resolveEnvRefs() {
+	if c.Audit.Secret == "" && c.Audit.SecretEnv != "" {
+		c.Audit.Secret = os.Getenv(c.Audit.SecretEnv)
+	}
 	if c.Panel.Token == "" && c.Panel.TokenEnv != "" {
 		c.Panel.Token = os.Getenv(c.Panel.TokenEnv)
 	}
@@ -491,6 +531,25 @@ func (c *Config) resolveEnvRefs() {
 // Fields that must be unique per instance (config_dir, cert_dir, instance_id)
 // are intentionally excluded.
 func (c *Config) inheritFrom(parent *Config) {
+	if c.Audit.URL == "" {
+		c.Audit.URL = parent.Audit.URL
+	}
+	if c.Audit.Site == "" {
+		c.Audit.Site = parent.Audit.Site
+	}
+	if c.Audit.Secret == "" && c.Audit.SecretEnv == "" {
+		c.Audit.Secret = parent.Audit.Secret
+		c.Audit.SecretEnv = parent.Audit.SecretEnv
+	}
+	if c.Audit.AgentID == "" {
+		c.Audit.AgentID = parent.Audit.AgentID
+	}
+	if c.Audit.QueueSize == 0 {
+		c.Audit.QueueSize = parent.Audit.QueueSize
+	}
+	if c.Audit.BatchSize == 0 {
+		c.Audit.BatchSize = parent.Audit.BatchSize
+	}
 	// Log
 	if c.Log.Level == "" {
 		c.Log.Level = parent.Log.Level
@@ -618,6 +677,11 @@ func (c *Config) inheritFrom(parent *Config) {
 }
 
 func (c *Config) setDefaultsFrom(baseDir string) {
+	// Without an explicit audit.site, events are attributed to the panel
+	// domain; Flux maps the domains of known panels to its site keys.
+	if c.Audit.URL != "" && c.Audit.Site == "" {
+		c.Audit.Site = panelHost(c.Panel.URL)
+	}
 	if c.Kernel.Type == "" {
 		c.Kernel.Type = "singbox"
 	}
@@ -672,6 +736,16 @@ func (c *Config) setDefaultsFrom(baseDir string) {
 
 func (c *Config) IsMachineMode() bool {
 	return c.Machine != nil && c.Machine.MachineID > 0
+}
+
+// panelHost returns the lowercase host name of a panel URL without port or
+// trailing dot, or "" when the URL has no host.
+func panelHost(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
 }
 
 func (c *Config) AutoInstanceID() (string, error) {
@@ -755,6 +829,26 @@ func normalizeBaseURL(raw string) (string, string, error) {
 }
 
 func (c *Config) validate() error {
+	if c.Audit.URL != "" {
+		if c.Audit.Secret == "" {
+			return fmt.Errorf("audit.secret (or secret_env) is required when audit.url is configured")
+		}
+		if c.Audit.Site == "" {
+			return fmt.Errorf("audit.site is required when audit.url is configured without a panel.url")
+		}
+		if len(c.Audit.Site) > audit.MaxSiteBytes {
+			return fmt.Errorf("audit.site must not exceed %d bytes", audit.MaxSiteBytes)
+		}
+		// Reject a bad URL, agent ID or queue/batch size at load time rather
+		// than when the service starts.
+		uploader := audit.Config{
+			URL: c.Audit.URL, Secret: c.Audit.Secret, Site: c.Audit.Site,
+			AgentID: c.Audit.AgentID, QueueSize: c.Audit.QueueSize, BatchSize: c.Audit.BatchSize,
+		}
+		if err := uploader.Validate(); err != nil {
+			return err
+		}
+	}
 	if c.IsStandalone() {
 		if err := c.validateStandalone(); err != nil {
 			return err

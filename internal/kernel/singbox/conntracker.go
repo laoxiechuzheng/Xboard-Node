@@ -15,6 +15,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"golang.org/x/time/rate"
 
+	"github.com/cedar2025/xboard-node/internal/audit"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
@@ -127,7 +128,10 @@ type ConnTracker struct {
 	uuidMap map[string]int           // UUID → userID (for lookup in RoutedConnection)
 	connMap map[string]*trackedEntry // connID → live TCP conn (force-close + idle janitor)
 
-	idCounter atomic.Int64
+	// Retain UUID ownership for this instance so an old QUIC session cannot
+	// become a different panel account after a remove/add cycle.
+	uuidOwners map[string]int
+	idCounter  atomic.Int64
 
 	// idleTimeout is the sing-box equivalent of xray's connIdle. A TCP
 	// connection with no read/write activity for this long is closed by the
@@ -144,6 +148,9 @@ type ConnTracker struct {
 	globalDevices    map[int]map[string]bool // userID → IP → exists
 	globalMu         sync.RWMutex
 	globalLastUpdate time.Time
+	auditSink        audit.Sink
+	auditNodeID      int
+	auditProtocol    string
 }
 
 // NewConnTracker creates a tracker.
@@ -152,6 +159,7 @@ func NewConnTracker(idleTimeout time.Duration) *ConnTracker {
 		users:         make(map[int]*userStats),
 		uuidMap:       make(map[string]int),
 		connMap:       make(map[string]*trackedEntry),
+		uuidOwners:    make(map[string]int),
 		globalDevices: make(map[int]map[string]bool),
 		idleTimeout:   idleTimeout,
 	}
@@ -184,12 +192,29 @@ func (t *ConnTracker) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
 // their stats until their connections drain.
 func (t *ConnTracker) SetUserMap(m map[string]int) {
 	t.usersMu.Lock()
-	t.uuidMap = m
-	for _, uid := range m {
+	t.uuidMap = make(map[string]int, len(m))
+	for uuid, uid := range m {
+		if uuid == "" || uid <= 0 {
+			continue
+		}
+		if owner, known := t.uuidOwners[uuid]; known && owner != uid {
+			t.uuidOwners[uuid] = 0
+			continue
+		}
+		t.uuidOwners[uuid] = uid
+		t.uuidMap[uuid] = uid
 		if _, ok := t.users[uid]; !ok {
 			t.users[uid] = &userStats{ips: make(map[string]int)}
 		}
 	}
+	t.usersMu.Unlock()
+}
+
+func (t *ConnTracker) SetAuditSink(sink audit.Sink, nodeID int, protocol string) {
+	t.usersMu.Lock()
+	t.auditSink = sink
+	t.auditNodeID = nodeID
+	t.auditProtocol = protocol
 	t.usersMu.Unlock()
 }
 
@@ -231,9 +256,25 @@ func (t *ConnTracker) RoutedConnection(
 	sourceIP := metadata.Source.Addr.String()
 
 	t.usersMu.RLock()
-	uid := t.uuidMap[uuid]
-	us := t.users[uid]
+	uid, known := t.uuidMap[uuid]
+	var us *userStats
+	if known && uid > 0 {
+		us = t.users[uid]
+	}
+	auditSink, auditNodeID, auditProtocol := t.auditSink, t.auditNodeID, t.auditProtocol
 	t.usersMu.RUnlock()
+
+	// HY2 and TUIC authenticate by slot index: a user that is not in the map is
+	// a retired or ambiguous slot and must never be served or attributed.
+	if metadata.InboundType == "hysteria2" || metadata.InboundType == "tuic" {
+		if us == nil {
+			_ = conn.Close()
+			return conn
+		}
+	}
+	if metadata.InboundType == "hysteria2" {
+		auditProtocol = "hysteria2"
+	}
 
 	// Device limit gate-keeping
 	if dlf := t.deviceLimitFunc.Load(); dlf != nil {
@@ -245,6 +286,9 @@ func (t *ConnTracker) RoutedConnection(
 				return conn
 			}
 		}
+	}
+	if auditSink != nil && uid > 0 {
+		auditSink.Record(audit.Event{UserID: uid, UUID: uuid, NodeID: auditNodeID, Core: "singbox", Protocol: auditProtocol, Network: "tcp", SourceIP: sourceIP, Target: metadata.Destination.String()})
 	}
 
 	// Register connection
@@ -295,9 +339,25 @@ func (t *ConnTracker) RoutedPacketConnection(
 	sourceIP := metadata.Source.Addr.String()
 
 	t.usersMu.RLock()
-	uid := t.uuidMap[uuid]
-	us := t.users[uid]
+	uid, known := t.uuidMap[uuid]
+	var us *userStats
+	if known && uid > 0 {
+		us = t.users[uid]
+	}
+	auditSink, auditNodeID, auditProtocol := t.auditSink, t.auditNodeID, t.auditProtocol
 	t.usersMu.RUnlock()
+
+	// HY2 and TUIC authenticate by slot index: a user that is not in the map is
+	// a retired or ambiguous slot and must never be served or attributed.
+	if metadata.InboundType == "hysteria2" || metadata.InboundType == "tuic" {
+		if us == nil {
+			_ = conn.Close()
+			return conn
+		}
+	}
+	if metadata.InboundType == "hysteria2" {
+		auditProtocol = "hysteria2"
+	}
 
 	// Device limit gate-keeping
 	if dlf := t.deviceLimitFunc.Load(); dlf != nil {
@@ -309,6 +369,9 @@ func (t *ConnTracker) RoutedPacketConnection(
 				return conn
 			}
 		}
+	}
+	if auditSink != nil && uid > 0 {
+		auditSink.Record(audit.Event{UserID: uid, UUID: uuid, NodeID: auditNodeID, Core: "singbox", Protocol: auditProtocol, Network: "udp", SourceIP: sourceIP, Target: metadata.Destination.String()})
 	}
 
 	if us != nil {
@@ -880,14 +943,14 @@ func (c *trackedPacketConn) UnwrapPacketReader() (N.PacketReader, []N.CountFunc)
 	if c.us == nil {
 		return c.PacketConn, nil
 	}
-	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.download)}
+	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.upload)}
 }
 
 func (c *trackedPacketConn) UnwrapPacketWriter() (N.PacketWriter, []N.CountFunc) {
 	if c.us == nil {
 		return c.PacketConn, nil
 	}
-	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.upload)}
+	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.download)}
 }
 
 func (c *trackedPacketConn) Upstream() any           { return c.PacketConn }

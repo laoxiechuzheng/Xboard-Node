@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cedar2025/xboard-node/internal/audit"
 	"github.com/cedar2025/xboard-node/internal/cert"
 	"github.com/cedar2025/xboard-node/internal/cert/dnsproviders"
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -38,6 +39,7 @@ type Service struct {
 	limiter      *limiter.Limiter
 	speedTracker *limiter.SpeedTracker
 	cert         *cert.Manager
+	auditClient  *audit.Handle
 
 	lastConfig *model.NodeSpec
 	lastUsers  []model.UserSpec
@@ -143,16 +145,31 @@ func NewWithControlPlane(cfg *config.Config, cp controlplane.ControlPlane) *Serv
 
 func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 	certMgr := cert.NewManager(cfg.Cert)
+	kcfg := cfg.Kernel
+	var auditClient *audit.Handle
+	if cfg.Audit.URL != "" {
+		handle, auditErr := audit.Acquire(audit.Config{
+			URL: cfg.Audit.URL, Secret: cfg.Audit.Secret, Site: cfg.Audit.Site,
+			AgentID: cfg.Audit.AgentID, QueueSize: cfg.Audit.QueueSize, BatchSize: cfg.Audit.BatchSize,
+		})
+		if auditErr != nil {
+			// Audit is best effort: a bad uploader must never stop the proxy.
+			nlog.Core().Error("audit uploader disabled", "instance", cfg.InstanceID, "error", auditErr)
+		} else {
+			auditClient = handle
+			kcfg.AuditSink = handle
+		}
+	}
 
 	var k kernel.Kernel
 	switch cfg.Kernel.Type {
 	case "singbox":
-		k = singbox.New(cfg.Kernel)
+		k = singbox.New(kcfg)
 	case "xray":
-		k = xray.New(cfg.Kernel)
+		k = xray.New(kcfg)
 	default:
 		nlog.Core().Warn("unsupported kernel type, defaulting to sing-box", "type", cfg.Kernel.Type)
-		k = singbox.New(cfg.Kernel)
+		k = singbox.New(kcfg)
 	}
 
 	l := limiter.New()
@@ -167,6 +184,7 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 		limiter:      l,
 		speedTracker: st,
 		cert:         certMgr,
+		auditClient:  auditClient,
 		wsEvents:     make(chan controlplane.Event, 64),
 		wsStatusCh:   make(chan controlplane.StatusChange, 16),
 		pullResults:  make(chan pullResult, 1),
@@ -174,6 +192,9 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	if s.auditClient != nil {
+		defer s.auditClient.Close()
+	}
 	// Start cert manager (handles auto-TLS or manual cert verification)
 	if err := s.cert.Start(ctx); err != nil {
 		return fmt.Errorf("cert manager: %w", err)
@@ -1094,6 +1115,15 @@ func (s *Service) buildMetrics(status monitor.Status) map[string]interface{} {
 	online := s.tracker.CurrentOnline()
 
 	m["uptime"] = status.Uptime
+	if s.auditClient != nil {
+		stats := s.auditClient.Snapshot()
+		m["audit"] = map[string]interface{}{
+			"queued":   stats.Queued,
+			"uploaded": stats.Uploaded,
+			"dropped":  stats.Dropped,
+			"retries":  stats.Retries,
+		}
+	}
 	m["goroutines"] = status.Goroutines
 
 	// Active connections (last measured during tracker.Process()).
@@ -1260,7 +1290,7 @@ func validateNodeRuntime(cfg *config.Config, kcfgSupported []string, spec *model
 func validateTLSRequirements(spec *model.NodeSpec, tls kernel.TLSCert, kernelType string) error {
 	needsCert := false
 	switch spec.Protocol {
-	case "hysteria", "hysteria2", "tuic", "anytls":
+	case "hysteria", "hysteria2", "hy2", "tuic", "anytls":
 		needsCert = true
 	case "trojan":
 		if spec.TLS != 2 {

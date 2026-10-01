@@ -1,24 +1,25 @@
 package xray
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
-	"sync"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/net"
 
+	"github.com/cedar2025/xboard-node/internal/audit"
 	"github.com/cedar2025/xboard-node/internal/model"
-	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
 type auditLogger struct {
-	mu       sync.Mutex
-	file     *os.File
-	path     string
-	enabled  bool
+	enabled atomic.Bool
+	context atomic.Pointer[auditContext]
+	remote  audit.Sink
+	output  *auditLogger
+}
+
+type auditContext struct {
 	protocol string
 	nodeID   int
 	users    map[string]auditUser
@@ -29,52 +30,23 @@ type auditUser struct {
 	UUID string `json:"uuid"`
 }
 
-type auditEntry struct {
-	Time     string `json:"time"`
-	Event    string `json:"event"`
-	UserID   int    `json:"user_id"`
-	UUID     string `json:"uuid"`
-	Email    string `json:"email"`
-	NodeID   int    `json:"node_id,omitempty"`
-	Protocol string `json:"protocol,omitempty"`
-	Network  string `json:"network"`
-	SourceIP string `json:"source_ip"`
-	Target   string `json:"target"`
+func newAuditLogger(remote audit.Sink) *auditLogger {
+	if remote == nil {
+		return nil
+	}
+	a := &auditLogger{remote: remote}
+	a.enabled.Store(true)
+	a.context.Store(&auditContext{users: make(map[string]auditUser)})
+	return a
 }
 
-func newAuditLogger(path string) *auditLogger {
-	if path == "" {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		nlog.Core().Error("xray audit: create log dir failed", "path", path, "error", err)
-		return nil
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		nlog.Core().Error("xray audit: open log failed", "path", path, "error", err)
-		return nil
-	}
-	nlog.Core().Info("xray audit log enabled", "path", path)
-	return &auditLogger{
-		file:    f,
-		path:    path,
-		enabled: true,
-		users:   make(map[string]auditUser),
-	}
-}
+func newRemoteAudit(remote audit.Sink) *auditLogger { return newAuditLogger(remote) }
 
 func (a *auditLogger) Close() {
 	if a == nil {
 		return
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.file != nil {
-		_ = a.file.Close()
-		a.file = nil
-	}
-	a.enabled = false
+	a.enabled.Store(false)
 }
 
 func (a *auditLogger) UpdateContext(nc *model.NodeSpec, users []model.UserSpec) {
@@ -91,15 +63,21 @@ func (a *auditLogger) UpdateContext(nc *model.NodeSpec, users []model.UserSpec) 
 	protocol := ""
 	nodeID := 0
 	if nc != nil {
-		protocol = nc.Protocol
+		protocol = audit.NormalizeProtocol(nc.Protocol, nc.Version)
 		nodeID = nc.NodeID
 	}
 
-	a.mu.Lock()
-	a.users = m
-	a.protocol = protocol
-	a.nodeID = nodeID
-	a.mu.Unlock()
+	a.context.Store(&auditContext{users: m, protocol: protocol, nodeID: nodeID})
+}
+
+func (a *auditLogger) forContext(nc *model.NodeSpec, users []model.UserSpec) *auditLogger {
+	if a == nil {
+		return nil
+	}
+	scoped := &auditLogger{output: a}
+	scoped.enabled.Store(true)
+	scoped.UpdateContext(nc, users)
+	return scoped
 }
 
 func (a *auditLogger) LogAccepted(email, sourceIP string, dest net.Destination) {
@@ -114,31 +92,25 @@ func (a *auditLogger) LogAccepted(email, sourceIP string, dest net.Destination) 
 	} else {
 		network = fmt.Sprint(dest.Network)
 	}
-	entryTime := time.Now().Format(time.RFC3339Nano)
-	target := dest.String()
+	target := strings.TrimPrefix(dest.String(), network+":")
 
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if !a.enabled || a.file == nil {
+	if !a.enabled.Load() {
 		return
 	}
-	au := a.users[email]
-	entry := auditEntry{
-		Time:     entryTime,
-		Event:    "accepted",
-		UserID:   au.ID,
-		UUID:     au.UUID,
-		Email:    email,
-		NodeID:   a.nodeID,
-		Protocol: a.protocol,
-		Network:  network,
-		SourceIP: sourceIP,
-		Target:   target,
-	}
-	data, err := json.Marshal(entry)
-	if err != nil {
+	ctx := a.context.Load()
+	if ctx == nil {
 		return
 	}
-	_, _ = a.file.Write(append(data, '\n'))
+	au := ctx.users[email]
+	output := a.output
+	if output == nil {
+		output = a
+	}
+	if !output.enabled.Load() {
+		return
+	}
+	if output.remote == nil || au.ID <= 0 {
+		return
+	}
+	output.remote.Record(audit.Event{Time: time.Now().UTC(), Event: "accepted", UserID: au.ID, UUID: au.UUID, NodeID: ctx.nodeID, Core: "xray", Protocol: ctx.protocol, Network: network, SourceIP: sourceIP, Target: target})
 }
-

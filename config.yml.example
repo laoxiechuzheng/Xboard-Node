@@ -32,6 +32,14 @@
 #   #                                   # enforce (reject new devices).
 # log:
 #   level: "none"      # disable xboard-node application logs
+# audit:               # connection log upload to Flux; memory only, never written to disk
+#   url: "https://flux.yihetang.icu/api/node-audit/v2/ingest"
+#   secret: "flux-ingest-secret"  # or secret_env: "AUDIT_SECRET"
+#   # Optional:
+#   # site: "98k"           # default: each instance's panel domain, mapped to a site by Flux
+#   # agent_id: "jp-01"     # default: hostname
+#   # queue_size: 16384     # in-memory events shared by the whole process
+#   # batch_size: 512       # events per signed gzip batch
 # runtime:
 #   # Lower = less RSS, slightly more GC CPU. Omitted = no soft cap.
 #   gomemlimit: "600MiB"  # soft RSS cap; GC becomes aggressive above this

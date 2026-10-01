@@ -48,28 +48,30 @@ type instanceRow struct {
 }
 
 type fileRootConfig struct {
-	Log       *fileLogConfig     `yaml:"log,omitempty"`
-	Kernel    *fileKernelConfig  `yaml:"kernel,omitempty"`
-	Node      *fileNodeConfig    `yaml:"node,omitempty"`
-	WS        *config.WSConfig   `yaml:"ws,omitempty"`
-	Runtime   *fileRuntimeConfig `yaml:"runtime,omitempty"`
-	Cert      *config.CertConfig `yaml:"cert,omitempty"`
+	Log       *fileLogConfig      `yaml:"log,omitempty"`
+	Kernel    *fileKernelConfig   `yaml:"kernel,omitempty"`
+	Node      *fileNodeConfig     `yaml:"node,omitempty"`
+	WS        *config.WSConfig    `yaml:"ws,omitempty"`
+	Runtime   *fileRuntimeConfig  `yaml:"runtime,omitempty"`
+	Cert      *config.CertConfig  `yaml:"cert,omitempty"`
+	Audit     *config.AuditConfig `yaml:"audit,omitempty"`
 	Instances []fileInstance      `yaml:"instances,omitempty"`
 }
 
 type fileInstance struct {
-	ID         string             `yaml:"id,omitempty"`
-	Panel      filePanelConfig    `yaml:"panel"`
-	Node       *fileNodeConfig    `yaml:"node,omitempty"`
-	Kernel     fileKernelConfig   `yaml:"kernel"`
-	Log        fileLogConfig      `yaml:"log"`
-	Runtime    *fileRuntimeConfig `yaml:"runtime,omitempty"`
-	HealthPort int                `yaml:"health_port,omitempty"`
-	Machine    *fileMachineConfig `yaml:"machine,omitempty"`
-	Standalone map[string]any     `yaml:"standalone,omitempty"`
-	Cert       *config.CertConfig `yaml:"cert,omitempty"`
-	WS         *config.WSConfig   `yaml:"ws,omitempty"`
-	Nodes      []config.NodeEntry `yaml:"nodes,omitempty"`
+	ID         string              `yaml:"id,omitempty"`
+	Panel      filePanelConfig     `yaml:"panel"`
+	Node       *fileNodeConfig     `yaml:"node,omitempty"`
+	Kernel     fileKernelConfig    `yaml:"kernel"`
+	Log        fileLogConfig       `yaml:"log"`
+	Runtime    *fileRuntimeConfig  `yaml:"runtime,omitempty"`
+	HealthPort int                 `yaml:"health_port,omitempty"`
+	Machine    *fileMachineConfig  `yaml:"machine,omitempty"`
+	Standalone map[string]any      `yaml:"standalone,omitempty"`
+	Cert       *config.CertConfig  `yaml:"cert,omitempty"`
+	Audit      *config.AuditConfig `yaml:"audit,omitempty"`
+	WS         *config.WSConfig    `yaml:"ws,omitempty"`
+	Nodes      []config.NodeEntry  `yaml:"nodes,omitempty"`
 }
 
 type filePanelConfig struct {
@@ -869,6 +871,10 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 	if p.Cert.CertMode != "" || p.Cert.Domain != "" || p.Cert.CertFile != "" || p.Cert.AutoTLS {
 		out.Cert = &p.Cert
 	}
+	// Without this the next xbctl rewrite would silently drop the audit uploader settings.
+	if p.Audit != (config.AuditConfig{}) {
+		out.Audit = &p.Audit
+	}
 
 	for _, inst := range instances {
 		fi := fileInstance{
@@ -918,6 +924,9 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 		}
 		if inst.Cert.CertMode != "" || inst.Cert.Domain != "" || inst.Cert.CertFile != "" || inst.Cert.AutoTLS {
 			fi.Cert = &inst.Cert
+		}
+		if inst.Audit != (config.AuditConfig{}) {
+			fi.Audit = &inst.Audit
 		}
 		if inst.WS.StatusInterval != 0 || inst.WS.HandshakeTimeout != 0 || inst.WS.BackoffInitial != 0 {
 			fi.WS = &inst.WS

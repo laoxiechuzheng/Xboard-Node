@@ -28,7 +28,7 @@ require (
 	github.com/libdns/route53 v1.6.0
 	github.com/libdns/tencentcloud v1.4.3
 	github.com/libdns/vultr/v2 v2.0.4
-	github.com/sagernet/sing v0.8.2
+	github.com/sagernet/sing v0.8.12
 	github.com/sagernet/sing-box v1.13.2
 	github.com/shirou/gopsutil/v4 v4.26.2
 	github.com/xtls/xray-core v1.260327.0

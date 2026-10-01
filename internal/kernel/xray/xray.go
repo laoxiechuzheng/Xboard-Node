@@ -15,9 +15,9 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/uuid"
 	xrayCore "github.com/xtls/xray-core/core"
+	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/stats"
-	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/infra/conf/serial"
 	xrayProxy "github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
@@ -32,8 +32,8 @@ import (
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/kernel/geodata"
-	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
 const (
@@ -76,10 +76,7 @@ type Xray struct {
 }
 
 func New(cfg config.KernelConfig) *Xray {
-	var audit *auditLogger
-	if !config.IsLogLevelDisabled(cfg.LogLevel) {
-		audit = newAuditLogger(cfg.AuditLog)
-	}
+	audit := newAuditLogger(cfg.AuditSink)
 	return &Xray{
 		cfg:        cfg,
 		cumTraffic: make(map[int][2]int64),
@@ -142,6 +139,7 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	if err != nil {
 		return fmt.Errorf("create xray: %w", err)
 	}
+	x.configureDispatcher(ld, nodeConfig, users)
 
 	// ── Phase 3: Start new (no lock, potentially slow) ──────────────────
 	if err := startWithTimeout(inst, startTimeout); err != nil {
@@ -165,17 +163,9 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	x.running.Store(true)
 	x.mu.Unlock()
 
-	if ld != nil {
-		ld.SetAuditLogger(x.audit)
-	}
-	if x.audit != nil {
-		x.audit.UpdateContext(nodeConfig, users)
-	}
-
 	// ── Phase 5: Recycle old (background, non-blocking) ─────────────────
 	closeOld(old, oldLD)
 
-	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
 
 	nlog.Core().Info("xray started",
@@ -190,9 +180,6 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 // instance restart for most transport/TLS settings, it triggers a full restart
 // if any kernel-affecting fields (hash mismatch) have changed.
 func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
-	x.updateDispatcherLimits(users)
-	x.updateBandwidthLimits(users)
-
 	newHash := kernel.ComputeHash(nodeConfig, users)
 
 	x.mu.Lock()
@@ -200,6 +187,8 @@ func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ke
 	if same {
 		x.users = users
 		x.mu.Unlock()
+		x.updateDispatcherLimits(users)
+		x.updateBandwidthLimits(users)
 		nlog.Core().Debug("xray: limits updated, kernel configuration unchanged")
 		return nil
 	}
@@ -327,7 +316,7 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 		x.users = merged
 		x.mu.Unlock()
 		x.updateDispatcherLimits(merged)
-	x.updateBandwidthLimits(merged)
+		x.updateBandwidthLimits(merged)
 		return 0, nil
 	}
 
@@ -803,7 +792,13 @@ func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 		}
 		return
 	}
+	x.configureDispatcher(ld, nc, users)
+}
 
+func (x *Xray) configureDispatcher(ld *LimitDispatcher, nc *model.NodeSpec, users []model.UserSpec) {
+	if ld == nil {
+		return
+	}
 	emailToUID := make(map[string]int, len(users)*2)
 	deviceLimits := make(map[string]int)
 
@@ -818,9 +813,13 @@ func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 	}
 
 	ld.UpdateLimits(emailToUID, deviceLimits, nil)
-	ld.SetAuditLogger(x.audit)
 	if x.audit != nil {
-		x.audit.UpdateContext(nc, users)
+		logger := ld.auditLog()
+		if logger == nil {
+			ld.SetAuditLogger(x.audit.forContext(nc, users))
+		} else {
+			logger.UpdateContext(nc, users)
+		}
 	}
 }
 

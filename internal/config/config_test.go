@@ -54,6 +54,276 @@ log:
 	}
 }
 
+func TestLoadRootInheritsAuditAndResolvesSecretEnv(t *testing.T) {
+	t.Setenv("TEST_FLUX_AUDIT_SECRET", "test-secret")
+	path := writeTemp(t, `
+audit:
+  url: "https://flux.example/api/node-audit/ingest"
+  site: "jpxd"
+  secret_env: "TEST_FLUX_AUDIT_SECRET"
+instances:
+  - panel:
+      url: "https://panel.example.com"
+      token: "panel-token"
+      node_id: 1
+    kernel:
+      type: xray
+      log_level: none
+  - panel:
+      url: "https://panel.example.com"
+      token: "panel-token"
+      node_id: 2
+    kernel:
+      type: singbox
+      log_level: none
+`)
+	root, err := LoadRoot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances, err := root.NormalizeInstances()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cfg := range instances {
+		if cfg.Audit.URL != "https://flux.example/api/node-audit/ingest" || cfg.Audit.Site != "jpxd" || cfg.Audit.Secret != "test-secret" {
+			t.Fatalf("audit config not inherited/resolved: %+v", cfg.Audit)
+		}
+	}
+}
+
+func TestLoadRootInstanceSecretEnvOverridesParentSecret(t *testing.T) {
+	t.Setenv("TEST_CHILD_AUDIT_SECRET", "child-secret")
+	path := writeTemp(t, `
+audit:
+  url: "https://flux.example/api/node-audit/ingest"
+  site: "jpxd"
+  secret: "parent-secret"
+instances:
+  - panel:
+      url: "https://panel.example.com"
+      token: "panel-token"
+      node_id: 1
+    audit:
+      secret_env: "TEST_CHILD_AUDIT_SECRET"
+`)
+	root, err := LoadRoot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := root.Instances[0].Audit.Secret; got != "child-secret" {
+		t.Fatalf("instance audit secret = %q, want child-secret", got)
+	}
+}
+
+func TestLoadRootAuditEnvDoesNotOverrideInstanceIdentity(t *testing.T) {
+	t.Setenv("AUDIT_URL", "https://env.example/api/node-audit/ingest")
+	t.Setenv("AUDIT_SITE", "env-site")
+	t.Setenv("AUDIT_SECRET", "env-secret")
+	t.Setenv("AUDIT_AGENT_ID", "env-agent")
+	path := writeTemp(t, `
+instances:
+  - panel:
+      url: "https://98k.example.com"
+      token: "panel-token"
+      node_id: 1
+    audit:
+      url: "https://flux.example/api/node-audit/ingest"
+      site: "98k"
+      secret: "secret-98k"
+      agent_id: "agent-98k"
+  - panel:
+      url: "https://mg.example.com"
+      token: "panel-token"
+      node_id: 2
+    audit:
+      site: "mg"
+  - panel:
+      url: "https://yzy.example.com"
+      token: "panel-token"
+      node_id: 3
+`)
+	root, err := LoadRoot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicit := root.Instances[0].Audit
+	if explicit.URL != "https://flux.example/api/node-audit/ingest" || explicit.Site != "98k" || explicit.Secret != "secret-98k" || explicit.AgentID != "agent-98k" {
+		t.Fatalf("env overrode explicit instance audit: %+v", explicit)
+	}
+	partial := root.Instances[1].Audit
+	if partial.Site != "mg" || partial.URL != "https://env.example/api/node-audit/ingest" || partial.Secret != "env-secret" || partial.AgentID != "env-agent" {
+		t.Fatalf("env must only fill the fields an instance leaves empty: %+v", partial)
+	}
+	inherited := root.Instances[2].Audit
+	if inherited.Site != "env-site" || inherited.URL != "https://env.example/api/node-audit/ingest" {
+		t.Fatalf("env defaults not inherited: %+v", inherited)
+	}
+}
+
+// A machine only needs audit.url and the secret: each instance reports under
+// its own panel domain, which Flux maps to a site key.
+func TestLoadRootDerivesAuditSiteFromPanelDomain(t *testing.T) {
+	path := writeTemp(t, `
+audit:
+  url: "https://flux.example/api/node-audit/v2/ingest"
+  secret: "s"
+instances:
+  - panel:
+      url: "https://98KJC.top/"
+      token: "panel-token"
+    nodes:
+      - node_id: 475
+  - panel:
+      url: "https://mgjc.98kjc.top:8443/api"
+      token: "panel-token"
+    nodes:
+      - node_id: 598
+  - panel:
+      url: "https://grxm.98kjc.top."
+      token: "panel-token"
+    nodes:
+      - node_id: 583
+  - panel:
+      url: "https://other.example"
+      token: "panel-token"
+    nodes:
+      - node_id: 9
+    audit:
+      site: "yzy"
+`)
+	root, err := LoadRoot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances, err := root.NormalizeInstances()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"98kjc.top", "mgjc.98kjc.top", "grxm.98kjc.top", "yzy"}
+	for i, cfg := range instances {
+		if cfg.Audit.Site != want[i] {
+			t.Fatalf("instances[%d].audit.site = %q, want %q", i, cfg.Audit.Site, want[i])
+		}
+		if cfg.Audit.URL == "" || cfg.Audit.Secret != "s" {
+			t.Fatalf("instances[%d] lost inherited audit settings: %+v", i, cfg.Audit)
+		}
+	}
+}
+
+func TestLoadDerivesAuditSiteForSingleConfig(t *testing.T) {
+	path := writeTemp(t, `
+panel:
+  url: "https://Panel.Example.com:443"
+  token: "panel-token"
+  node_id: 1
+audit:
+  url: "https://flux.example/api/node-audit/v2/ingest"
+  secret: "s"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Audit.Site != "panel.example.com" {
+		t.Fatalf("audit.site = %q, want the panel domain", cfg.Audit.Site)
+	}
+}
+
+func TestLoadWithoutAuditKeepsSiteEmpty(t *testing.T) {
+	path := writeTemp(t, `
+panel:
+  url: "https://panel.example.com"
+  token: "panel-token"
+  node_id: 1
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Audit != (AuditConfig{}) {
+		t.Fatalf("audit settings appeared without audit.url: %+v", cfg.Audit)
+	}
+}
+
+func TestPanelHost(t *testing.T) {
+	cases := map[string]string{
+		"https://98kjc.top":             "98kjc.top",
+		" https://MGJC.98kjc.top/api/ ": "mgjc.98kjc.top",
+		"https://grxm.98kjc.top.:8443":  "grxm.98kjc.top",
+		"https://[2001:db8::1]:443":     "2001:db8::1",
+		"not a url":                     "",
+		"":                              "",
+	}
+	for raw, want := range cases {
+		if got := panelHost(raw); got != want {
+			t.Errorf("panelHost(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+func TestLoadAuditEnvOverridesSingleConfig(t *testing.T) {
+	t.Setenv("AUDIT_SITE", "env-site")
+	path := writeTemp(t, `
+panel:
+  url: "https://panel.example.com"
+  token: "panel-token"
+  node_id: 1
+audit:
+  url: "https://flux.example/api/node-audit/ingest"
+  site: "yaml-site"
+  secret: "s"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Audit.Site != "env-site" {
+		t.Fatalf("single-instance env override lost: %+v", cfg.Audit)
+	}
+}
+
+func TestLoadRejectsAuditWithoutSecret(t *testing.T) {
+	path := writeTemp(t, `
+panel:
+  url: "https://panel.example.com"
+  token: "panel-token"
+  node_id: 1
+audit:
+  url: "https://flux.example/api/node-audit/ingest"
+  site: "jpxd"
+  secret_env: "MISSING_TEST_FLUX_AUDIT_SECRET"
+`)
+	if _, err := Load(path); err == nil {
+		t.Fatal("audit endpoint without a configured secret must fail startup")
+	}
+}
+
+func TestLoadValidatesAuditUploaderSettingsAtLoadTime(t *testing.T) {
+	cases := []struct {
+		name    string
+		audit   string
+		wantErr bool
+	}{
+		{"valid https endpoint", "url: \"https://flux.example/api/node-audit/ingest\"\n  site: \"jpxd\"\n  secret: \"s\"", false},
+		{"plain http endpoint", "url: \"http://flux.example/api/node-audit/ingest\"\n  site: \"jpxd\"\n  secret: \"s\"", true},
+		{"agent id with spaces", "url: \"https://flux.example/api/node-audit/ingest\"\n  site: \"jpxd\"\n  secret: \"s\"\n  agent_id: \"bad agent\"", true},
+		{"batch larger than queue", "url: \"https://flux.example/api/node-audit/ingest\"\n  site: \"jpxd\"\n  secret: \"s\"\n  queue_size: 10\n  batch_size: 20", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeTemp(t, "panel:\n  url: \"https://panel.example.com\"\n  token: \"panel-token\"\n  node_id: 1\naudit:\n  "+tc.audit+"\n")
+			_, err := Load(path)
+			if tc.wantErr && err == nil {
+				t.Fatal("invalid audit uploader settings must fail at load time")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("valid audit settings rejected: %v", err)
+			}
+		})
+	}
+}
+
 func TestLoad_Defaults(t *testing.T) {
 	path := writeTemp(t, `
 panel:
@@ -326,7 +596,6 @@ kernel:
 		t.Fatal("expected error for standalone mode without users")
 	}
 }
-
 
 func TestLoadRoot_LegacyConfigNormalizesToSingleInstance(t *testing.T) {
 	path := writeTemp(t, `

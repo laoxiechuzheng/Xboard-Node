@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cedar2025/xboard-node/internal/audit"
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/machine"
 	"github.com/cedar2025/xboard-node/internal/nlog"
@@ -34,6 +35,8 @@ func main() {
 		fmt.Printf("xboard-node %s (built %s)\n", version, buildTime)
 		os.Exit(0)
 	}
+
+	audit.Version = version // reported with every audit batch; set before any uploader starts
 
 	rootCfg, err := config.LoadRoot(*configPath)
 	if err != nil {
