@@ -10,7 +10,7 @@
 # ── Multiple instances ──
 # kernel:
 #   type: "singbox"
-#   log_level: "none"  # disable embedded sing-box/xray logs and xray audit logging
+#   log_level: "none"  # disable embedded sing-box/xray operational logs; native audit remains enabled
 #   # ── xray connection policy (levels.0). Recommended defaults when omitted:
 #   #    handshake=4 conn_idle=35 uplink_only=3 downlink_only=5 buffer_size=128
 #   #   xray_policy:
