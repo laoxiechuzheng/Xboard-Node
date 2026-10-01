@@ -449,12 +449,16 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 			nlog.Core().Warn("ws: config payload missing protocol")
 			return
 		}
-		event.Config = &p.Config
 		if p.NodeID > 0 {
 			event.NodeID = p.NodeID
 		} else if p.Config.NodeID > 0 {
 			event.NodeID = p.Config.NodeID
+		} else if w.cfg.MachineID <= 0 && w.nodeID > 0 {
+			event.NodeID = w.nodeID
 		}
+		// Config consumers must use the same identity as machine event routing.
+		p.Config.NodeID = event.NodeID
+		event.Config = &p.Config
 
 	case WSEventSyncUsers:
 		nlog.Core().Debug("ws sync users event received")

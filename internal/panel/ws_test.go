@@ -133,6 +133,9 @@ func TestWSClient_ConnectAndReceiveDataEvents(t *testing.T) {
 	if received[0].Config.ServerPort != 443 {
 		t.Errorf("config.ServerPort = %d, want 443", received[0].Config.ServerPort)
 	}
+	if received[0].NodeID != 1 || received[0].Config.NodeID != 1 {
+		t.Errorf("config node identity: event=%d config=%d, want 1", received[0].NodeID, received[0].Config.NodeID)
+	}
 
 	// Verify users event
 	if received[1].Type != WSEventSyncUsers {
@@ -147,6 +150,253 @@ func TestWSClient_ConnectAndReceiveDataEvents(t *testing.T) {
 
 	if !ws.IsConnected() {
 		t.Error("expected IsConnected() = true while server is running")
+	}
+}
+
+func TestWSClient_ConfigNodeIdentity(t *testing.T) {
+	tests := []struct {
+		name      string
+		nodeID    int
+		machineID int
+		data      string
+		wantID    int
+	}{
+		{name: "legacy_missing_ids", nodeID: 41, data: `{"config":{"protocol":"vless","server_port":443}}`, wantID: 41},
+		{name: "legacy_zero_ids", nodeID: 41, data: `{"node_id":0,"config":{"node_id":0,"protocol":"vless","server_port":443}}`, wantID: 41},
+		{name: "single_outer_id", nodeID: 41, data: `{"node_id":17,"config":{"protocol":"vless","server_port":443}}`, wantID: 17},
+		{name: "single_nested_id", nodeID: 41, data: `{"config":{"node_id":23,"protocol":"vless","server_port":443}}`, wantID: 23},
+		{name: "machine_outer_id", machineID: 9, data: `{"node_id":17,"config":{"protocol":"vless","server_port":443}}`, wantID: 17},
+		{name: "machine_nested_id", machineID: 9, data: `{"config":{"node_id":23,"protocol":"vless","server_port":443}}`, wantID: 23},
+		{name: "machine_matching_ids", machineID: 9, data: `{"node_id":17,"config":{"node_id":17,"protocol":"vless","server_port":443}}`, wantID: 17},
+		{name: "machine_conflicting_ids_outer_wins", machineID: 9, data: `{"node_id":17,"config":{"node_id":23,"protocol":"vless","server_port":443}}`, wantID: 17},
+		{name: "single_conflicting_ids_outer_wins", nodeID: 41, data: `{"node_id":17,"config":{"node_id":23,"protocol":"vless","server_port":443}}`, wantID: 17},
+		{name: "weakly_typed_outer_id", machineID: 9, data: `{"node_id":"17","config":{"protocol":"vless","server_port":"443"}}`, wantID: 17},
+		{name: "weakly_typed_nested_id", machineID: 9, data: `{"config":{"node_id":"23","protocol":"vless","server_port":443}}`, wantID: 23},
+		{name: "nonpositive_outer_uses_nested", machineID: 9, data: `{"node_id":-1,"config":{"node_id":23,"protocol":"vless","server_port":443}}`, wantID: 23},
+		{name: "machine_missing_ids_remain_unroutable", machineID: 9, data: `{"config":{"protocol":"vless","server_port":443}}`, wantID: 0},
+		{name: "machine_does_not_use_single_node_fallback", nodeID: 41, machineID: 9, data: `{"config":{"protocol":"vless","server_port":443}}`, wantID: 0},
+		{name: "unbound_client_missing_ids", data: `{"config":{"protocol":"vless","server_port":443}}`, wantID: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var received []WSEvent
+			w := NewWSClient("", "", tt.nodeID, WSClientConfig{MachineID: tt.machineID}, func(event WSEvent) {
+				received = append(received, event)
+			}, nil, nil)
+			w.handleMessage(wsMessage{Event: WSEventSyncConfig, Data: json.RawMessage(tt.data)})
+			if len(received) != 1 || received[0].Config == nil {
+				t.Fatalf("expected one config event, got %+v", received)
+			}
+			event := received[0]
+			if event.NodeID != tt.wantID {
+				t.Errorf("event.NodeID = %d, want %d", event.NodeID, tt.wantID)
+			}
+			if event.Config.NodeID != tt.wantID {
+				t.Errorf("config.NodeID = %d, want %d", event.Config.NodeID, tt.wantID)
+			}
+			if event.Type != WSEventSyncConfig || event.Config.Protocol != "vless" || event.Config.ServerPort != 443 {
+				t.Errorf("unexpected config event: %+v config=%+v", event, event.Config)
+			}
+		})
+	}
+}
+
+func TestWSClient_ConfigInvalidPayloadsAreDropped(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+	}{
+		{name: "malformed_json", data: `{`},
+		{name: "array_envelope", data: `[]`},
+		{name: "null_envelope", data: `null`},
+		{name: "missing_config", data: `{"node_id":17}`},
+		{name: "missing_protocol", data: `{"node_id":17,"config":{"server_port":443}}`},
+		{name: "invalid_config_type", data: `{"node_id":17,"config":"invalid"}`},
+		{name: "invalid_node_id", data: `{"node_id":"invalid","config":{"protocol":"vless","server_port":443}}`},
+		{name: "invalid_port", data: `{"node_id":17,"config":{"protocol":"vless","server_port":"invalid"}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			count := 0
+			w := NewWSClient("", "", 41, WSClientConfig{}, func(WSEvent) { count++ }, nil, nil)
+			w.handleMessage(wsMessage{Event: WSEventSyncConfig, Data: json.RawMessage(tt.data)})
+			if count != 0 {
+				t.Fatalf("invalid config delivered %d events", count)
+			}
+		})
+	}
+}
+
+func TestWSClient_NonConfigRoutingIsUnchanged(t *testing.T) {
+	tests := []struct {
+		event  string
+		data   string
+		wantID int
+	}{
+		{event: WSEventSyncUsers, data: `{"users":[{"id":1,"uuid":"abc"}]}`, wantID: 0},
+		{event: WSEventSyncUsers, data: `{"node_id":17,"users":[{"id":1,"uuid":"abc"}]}`, wantID: 17},
+		{event: WSEventSyncUserDelta, data: `{"action":"add","users":[{"id":1,"uuid":"abc"}]}`, wantID: 0},
+		{event: WSEventSyncUserDelta, data: `{"node_id":17,"action":"add","users":[{"id":1,"uuid":"abc"}]}`, wantID: 17},
+		{event: WSEventSyncDevices, data: `{"users":{"1":["10.0.0.1"]}}`, wantID: 0},
+		{event: WSEventSyncDevices, data: `{"node_id":17,"users":{"1":["10.0.0.1"]}}`, wantID: 17},
+		{event: WSEventSyncNodes, data: `{"nodes":[]}`, wantID: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.event, func(t *testing.T) {
+			var received []WSEvent
+			w := NewWSClient("", "", 41, WSClientConfig{}, func(event WSEvent) {
+				received = append(received, event)
+			}, nil, nil)
+			w.handleMessage(wsMessage{Event: tt.event, Data: json.RawMessage(tt.data)})
+			if len(received) != 1 {
+				t.Fatalf("expected one event, got %+v", received)
+			}
+			if received[0].Type != tt.event || received[0].NodeID != tt.wantID || received[0].Config != nil {
+				t.Errorf("unexpected event routing: %+v, want node_id=%d", received[0], tt.wantID)
+			}
+		})
+	}
+}
+
+func TestWSClient_ConfigUpdatesKeepIndependentSnapshots(t *testing.T) {
+	var received []WSEvent
+	w := NewWSClient("", "", 41, WSClientConfig{}, func(event WSEvent) {
+		received = append(received, event)
+	}, nil, nil)
+	legacy := wsMessage{Event: WSEventSyncConfig, Data: json.RawMessage(`{"config":{"protocol":"vless","server_port":443}}`)}
+	w.handleMessage(legacy)
+	w.handleMessage(wsMessage{Event: WSEventSyncConfig, Data: json.RawMessage(`{"node_id":17,"config":{"protocol":"vless","server_port":8443}}`)})
+	w.handleMessage(legacy)
+	if len(received) != 3 {
+		t.Fatalf("expected three config events, got %d", len(received))
+	}
+	for i, wantID := range []int{41, 17, 41} {
+		if received[i].Config == nil {
+			t.Fatalf("event[%d].Config is nil", i)
+		}
+		if received[i].NodeID != wantID || received[i].Config.NodeID != wantID {
+			t.Errorf("event[%d] identity: event=%d config=%d, want %d", i, received[i].NodeID, received[i].Config.NodeID, wantID)
+		}
+	}
+	if received[0].Config.ServerPort != 443 || received[1].Config.ServerPort != 8443 || received[2].Config.ServerPort != 443 {
+		t.Errorf("config snapshots changed across updates: %+v, %+v, %+v", received[0].Config, received[1].Config, received[2].Config)
+	}
+	firstID, secondID := received[0].Config.NodeID, received[1].Config.NodeID
+	received[2].Config.NodeID = 99
+	if received[0].Config.NodeID != firstID || received[1].Config.NodeID != secondID {
+		t.Error("mutating a later config changed a retained snapshot")
+	}
+	if string(legacy.Data) != `{"config":{"protocol":"vless","server_port":443}}` {
+		t.Error("config normalization mutated the input payload")
+	}
+}
+
+func TestWSClient_ConfigIdentityAcrossReconnect(t *testing.T) {
+	tests := []struct {
+		name          string
+		nodeID        int
+		machineID     int
+		authNodeID    string
+		authMachineID string
+		payloads      []string
+		wantIDs       []int
+	}{
+		{
+			name: "legacy_single_node", nodeID: 41, authNodeID: "41",
+			payloads: []string{
+				`{"config":{"protocol":"vless","server_port":443}}`,
+				`{"config":{"protocol":"vless","server_port":8443}}`,
+				`{"config":{"protocol":"vless","server_port":9443}}`,
+			},
+			wantIDs: []int{41, 41, 41},
+		},
+		{
+			name: "machine_node_updates", machineID: 9, authMachineID: "9",
+			payloads: []string{
+				`{"node_id":17,"config":{"protocol":"vless","server_port":443}}`,
+				`{"node_id":23,"config":{"protocol":"vless","server_port":8443}}`,
+				`{"config":{"node_id":41,"protocol":"vless","server_port":9443}}`,
+			},
+			wantIDs: []int{17, 23, 41},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+			var mu sync.Mutex
+			connectCount := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				q := r.URL.Query()
+				if q.Get("node_id") != tt.authNodeID || q.Get("machine_id") != tt.authMachineID {
+					t.Errorf("unexpected authentication params: node_id=%q machine_id=%q", q.Get("node_id"), q.Get("machine_id"))
+					http.Error(w, "incorrect node identity", http.StatusUnauthorized)
+					return
+				}
+				conn, err := upgrader.Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				mu.Lock()
+				connectCount++
+				count := connectCount
+				mu.Unlock()
+				if count == 1 {
+					// Legacy panels may push config before auth.success.
+					conn.WriteJSON(wsMessage{Event: WSEventSyncConfig, Data: json.RawMessage(tt.payloads[0])})
+					return
+				}
+				if err := conn.WriteJSON(wsMessage{Event: "auth.success"}); err != nil {
+					return
+				}
+				for _, payload := range tt.payloads[1:] {
+					if err := conn.WriteJSON(wsMessage{Event: WSEventSyncConfig, Data: json.RawMessage(payload)}); err != nil {
+						return
+					}
+				}
+				for {
+					var msg wsMessage
+					if err := conn.ReadJSON(&msg); err != nil {
+						return
+					}
+				}
+			}))
+			t.Cleanup(server.Close)
+			events := make(chan WSEvent, 3)
+			w := NewWSClient("ws"+strings.TrimPrefix(server.URL, "http"), "test-token", tt.nodeID, WSClientConfig{
+				MachineID: tt.machineID, StatusInterval: time.Hour, BackoffInitial: 10 * time.Millisecond, BackoffMax: 10 * time.Millisecond,
+			}, func(event WSEvent) { events <- event }, nil, nil)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				w.Run(ctx)
+			}()
+			t.Cleanup(func() {
+				cancel()
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Error("WS client did not stop after cancellation")
+				}
+			})
+			for i, wantID := range tt.wantIDs {
+				select {
+				case event := <-events:
+					if event.Config == nil {
+						t.Fatalf("event[%d].Config is nil", i)
+					}
+					if event.NodeID != wantID || event.Config.NodeID != wantID {
+						t.Errorf("event[%d] identity: event=%d config=%d, want %d", i, event.NodeID, event.Config.NodeID, wantID)
+					}
+					if wantPort := []int{443, 8443, 9443}[i]; event.Config.ServerPort != wantPort {
+						t.Errorf("event[%d] port = %d, want %d", i, event.Config.ServerPort, wantPort)
+					}
+				case <-ctx.Done():
+					t.Fatalf("timed out waiting for config event %d", i)
+				}
+			}
+		})
 	}
 }
 
