@@ -10,6 +10,8 @@
 # ── Multiple instances ──
 # kernel:
 #   type: "singbox"
+#   force_proxy_protocol: false  # optional: Xray, or this fork's sing-box AnyTLS only
+#   # Accepts PROXY v1/v2 and plain TLS. Restrict the listener to trusted forwarders.
 #   log_level: "none"  # disable embedded sing-box/xray operational logs; native audit remains enabled
 #   # ── xray connection policy (levels.0). Recommended defaults when omitted:
 #   #    handshake=4 conn_idle=35 uplink_only=3 downlink_only=5 buffer_size=128

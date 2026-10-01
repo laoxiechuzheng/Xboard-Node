@@ -473,6 +473,11 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert,
 	case "tuic":
 		return buildTUIC(base, nc, users, tc)
 	case "anytls":
+		if nc.GetProxyProtocol() || (len(kcfgs) > 0 && kcfgs[0].ForceProxyProtocol) {
+			// Match Xray: accept PROXY headers while preserving ordinary TLS connections.
+			base["proxy_protocol"] = true
+			base["proxy_protocol_accept_no_header"] = true
+		}
 		return buildAnyTLS(base, nc, users, tc)
 	case "naive":
 		return buildNaive(base, nc, users, tc)

@@ -58,6 +58,17 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
 
+      - name: Set up Go for release tests
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify node and AnyTLS core before publishing
+        run: |
+          go test -race -count=1 -tags with_quic ./...
+          go test -race -count=1 -tags with_quic github.com/sagernet/sing-box/protocol/anytls
+
       - name: Build and push
         id: build-and-push
         uses: docker/build-push-action@v5

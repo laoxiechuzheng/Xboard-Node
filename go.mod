@@ -261,7 +261,7 @@ require (
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
 
-replace github.com/sagernet/sing-box => github.com/laoxiechuzheng/sing-box v1.14.0-laoxie.2
+replace github.com/sagernet/sing-box => github.com/laoxiechuzheng/sing-box v1.14.0-laoxie.3
 
 // Keep the existing sing-quic/quic-go/sing versions and backport only the
 // upstream UDP message-ownership fix. The replacement is deliberately at the

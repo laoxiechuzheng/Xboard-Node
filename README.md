@@ -77,6 +77,34 @@ kernel:
 
 `log.level: none` disables xboard-node application logs without creating `log.output`. `kernel.log_level: none` disables xray/sing-box core logs. Startup failures before the configuration is loaded and Go runtime panics may still be written directly to stderr.
 
+### AnyTLS PROXY protocol
+
+The sing-box AnyTLS inbound in this fork can accept PROXY protocol v1/v2 before its TLS handshake.
+Enable it with the existing kernel option:
+
+```yaml
+kernel:
+  type: "singbox"
+  force_proxy_protocol: true
+```
+
+This forces PROXY-header acceptance even when the panel does not enable it. Panel
+`accept_proxy_protocol: true` and `networkSettings.acceptProxyProtocol: true` also enable it.
+Both IPv4 and IPv6 addresses are passed to user traffic, alive-IP, device-limit and audit tracking.
+Plain TLS connections without a PROXY header remain accepted, matching the Xray acceptance mode.
+The option enables acceptance; it does not require every connection to have a header.
+Incomplete or malformed headers are rejected; header reads have a 10-second deadline.
+
+The default is off. This sing-box support is limited to AnyTLS; other sing-box protocols are unchanged.
+For a mixed-instance process, set the option under the intended instance's `kernel` section to limit its scope.
+Use the published image containing this fork's AnyTLS support, not an upstream sing-box image.
+
+PROXY headers are not authenticated. Restrict access to this backend listener to trusted forwarding
+servers with a firewall or private network. An untrusted peer can otherwise forge a client source IP.
+The forwarder must send its PROXY header before the original TLS handshake; no client-side setting is needed.
+Enabling this configuration requires restarting the target node process. No panel/database change is required.
+
+
 ### Connection audit (Flux)
 
 xboard-node natively records accepted, identified-user TCP connections and UDP sessions from Xray and sing-box,

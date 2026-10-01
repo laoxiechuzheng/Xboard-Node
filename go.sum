@@ -491,6 +491,8 @@ github.com/laoxiechuzheng/Xray-core v1.260327.0-laoxie.1 h1:I+nSRL4Fkbp9Aytu7BI4
 github.com/laoxiechuzheng/Xray-core v1.260327.0-laoxie.1/go.mod h1:OXMlhBloFry8mw0KwWLWLd3RQyXJzEYsCGlgsX36h60=
 github.com/laoxiechuzheng/sing-box v1.14.0-laoxie.2 h1:M/talIkrBVhYfaJrCMhD/AKUi3E++GGdFWd4HXFvhy4=
 github.com/laoxiechuzheng/sing-box v1.14.0-laoxie.2/go.mod h1:DTyWqWrjh/DqOHynCUgMhW8fgrkctleficRKwQmh668=
+github.com/laoxiechuzheng/sing-box v1.14.0-laoxie.3 h1:o38C4QD6S9ougAatA3Fbl4VZJOSsLmG61rwiLZh0FmU=
+github.com/laoxiechuzheng/sing-box v1.14.0-laoxie.3/go.mod h1:+JNwJlWmZ1etr5upaRV1qKFvoCxOtSzPvhMKMNaXrpQ=
 github.com/laoxiechuzheng/sing-quic v0.6.0-laoxie.2 h1:jpMK4aB5ud/5iISaWLJ1j7QvWAsjJIAUpuZBV3oLbVE=
 github.com/laoxiechuzheng/sing-quic v0.6.0-laoxie.2/go.mod h1:K5bWvITOm4vE10fwLfrWpw27bCoVJ+tfQ79tOWg+Ko8=
 github.com/letsencrypt/challtestsrv v1.4.2 h1:0ON3ldMhZyWlfVNYYpFuWRTmZNnyfiL9Hh5YzC3JVwU=
