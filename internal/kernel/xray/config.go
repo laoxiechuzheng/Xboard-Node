@@ -11,6 +11,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/nlog"
+	"github.com/xtls/xray-core/common/uuid"
 )
 
 // M is a shorthand for building JSON-like maps
@@ -376,6 +377,10 @@ func buildVMess(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TL
 func buildVLESS(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
 	clients := make([]M, 0, len(users))
 	for _, u := range users {
+		if _, err := uuid.ParseString(u.UUID); err != nil {
+			nlog.Core().Warn("xray: skip invalid VLESS user UUID", "user", u.ID)
+			continue
+		}
 		client := M{
 			"id":    u.UUID,
 			"email": userEmail(u.ID),
@@ -740,6 +745,8 @@ func buildRealitySettings(nc *model.NodeSpec) M {
 		switch v := sid.(type) {
 		case string:
 			reality["shortIds"] = []string{v}
+		case []string:
+			reality["shortIds"] = append([]string(nil), v...)
 		case []interface{}:
 			ids := make([]string, 0, len(v))
 			for _, item := range v {

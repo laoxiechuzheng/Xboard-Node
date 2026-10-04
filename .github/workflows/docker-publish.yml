@@ -21,6 +21,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -66,7 +67,7 @@ jobs:
 
       - name: Verify node and AnyTLS core before publishing
         run: |
-          go test -race -count=1 -tags with_quic ./...
+          GOFLAGS="-tags=with_quic" make test
           go test -race -count=1 -tags with_quic github.com/sagernet/sing-box/protocol/anytls
 
       - name: Build and push

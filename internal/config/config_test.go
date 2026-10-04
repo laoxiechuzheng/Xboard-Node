@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func writeTemp(t *testing.T, content string) string {
@@ -810,5 +813,303 @@ func TestInheritFrom_AutoTLSInheritedWhenChildHasNoCertConfig(t *testing.T) {
 	child.inheritFrom(parent)
 	if !child.Cert.AutoTLS {
 		t.Error("auto_tls should be inherited when child has no cert config")
+	}
+}
+
+type sharedRealityTestSettings struct {
+	Enabled    bool   `yaml:"enabled"`
+	ListenIP   string `yaml:"listen_ip"`
+	ListenPort int    `yaml:"listen_port"`
+}
+
+func sharedRealitySettings(t *testing.T, kernel any) *sharedRealityTestSettings {
+	t.Helper()
+	data, err := yaml.Marshal(kernel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		SharedReality *sharedRealityTestSettings `yaml:"shared_reality"`
+	}
+	if err := yaml.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	return decoded.SharedReality
+}
+
+func requireSharedRealitySettings(t *testing.T, kernel any, want sharedRealityTestSettings) {
+	t.Helper()
+	got := sharedRealitySettings(t, kernel)
+	if got == nil || *got != want {
+		t.Fatalf("shared_reality = %+v, want %+v", got, want)
+	}
+}
+
+func TestLoadSharedRealityDefaults(t *testing.T) {
+	cases := []struct {
+		name   string
+		kernel string
+		want   *sharedRealityTestSettings
+	}{
+		{"ordinary xray", "type: xray", nil},
+		{"ordinary singbox", "type: singbox", nil},
+		{"empty disabled settings", "type: singbox\n  shared_reality: {}", &sharedRealityTestSettings{}},
+		{"disabled ignores listener settings", "type: singbox\n  shared_reality:\n    enabled: false\n    listen_ip: not-an-ip\n    listen_port: -1", &sharedRealityTestSettings{false, "not-an-ip", -1}},
+		{"enabled defaults", "type: xray\n  shared_reality:\n    enabled: true", &sharedRealityTestSettings{true, "0.0.0.0", 443}},
+		{"explicit empty and zero", "type: xray\n  shared_reality:\n    enabled: true\n    listen_ip: \"\"\n    listen_port: 0", &sharedRealityTestSettings{true, "0.0.0.0", 443}},
+		{"explicit IPv4 and port", "type: xray\n  shared_reality:\n    enabled: true\n    listen_ip: 192.0.2.10\n    listen_port: 8443", &sharedRealityTestSettings{true, "192.0.2.10", 8443}},
+		{"IPv6 and maximum port", "type: xray\n  shared_reality:\n    enabled: true\n    listen_ip: '2001:db8::1'\n    listen_port: 65535", &sharedRealityTestSettings{true, "2001:db8::1", 65535}},
+		{"minimum port", "type: xray\n  shared_reality:\n    enabled: true\n    listen_port: 1", &sharedRealityTestSettings{true, "0.0.0.0", 1}},
+	}
+	loaders := []struct {
+		name string
+		load func(string) (*Config, error)
+	}{
+		{"Load", Load},
+		{"LoadRoot", func(path string) (*Config, error) {
+			root, err := LoadRoot(path)
+			if err != nil {
+				return nil, err
+			}
+			return &root.Config, nil
+		}},
+	}
+	for _, loader := range loaders {
+		for _, tc := range cases {
+			t.Run(loader.name+"/"+tc.name, func(t *testing.T) {
+				path := writeTemp(t, "panel:\n  url: https://panel.example.com\n  token: tok\n  node_id: 1\nkernel:\n  "+tc.kernel+"\n")
+				cfg, err := loader.load(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if tc.want == nil {
+					if got := sharedRealitySettings(t, cfg.Kernel); got != nil {
+						t.Fatalf("ordinary kernel gained shared_reality: %+v", got)
+					}
+					return
+				}
+				requireSharedRealitySettings(t, cfg.Kernel, *tc.want)
+			})
+		}
+	}
+}
+
+func TestLoadSharedRealityValidation(t *testing.T) {
+	cases := []struct {
+		name   string
+		kernel string
+		field  string
+	}{
+		{"hostname", "type: xray\n  shared_reality:\n    enabled: true\n    listen_ip: example.com", "listen_ip"},
+		{"CIDR", "type: xray\n  shared_reality:\n    enabled: true\n    listen_ip: 192.0.2.1/24", "listen_ip"},
+		{"invalid IPv4", "type: xray\n  shared_reality:\n    enabled: true\n    listen_ip: 999.0.0.1", "listen_ip"},
+		{"invalid IPv6", "type: xray\n  shared_reality:\n    enabled: true\n    listen_ip: '2001:db8::gg'", "listen_ip"},
+		{"negative port", "type: xray\n  shared_reality:\n    enabled: true\n    listen_port: -1", "listen_port"},
+		{"port exceeds maximum", "type: xray\n  shared_reality:\n    enabled: true\n    listen_port: 65536", "listen_port"},
+		{"singbox", "type: singbox\n  shared_reality:\n    enabled: true", "kernel.type"},
+		{"default singbox", "shared_reality:\n    enabled: true", "kernel.type"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeTemp(t, "panel:\n  url: https://panel.example.com\n  token: tok\n  node_id: 1\nkernel:\n  "+tc.kernel+"\n")
+			for name, load := range map[string]func(string) error{
+				"Load":     func(path string) error { _, err := Load(path); return err },
+				"LoadRoot": func(path string) error { _, err := LoadRoot(path); return err },
+			} {
+				t.Run(name, func(t *testing.T) {
+					err := load(path)
+					if err == nil || !strings.Contains(err.Error(), "shared_reality") || !strings.Contains(err.Error(), tc.field) {
+						t.Fatalf("error = %v, want shared_reality %s validation error", err, tc.field)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestLoadRootSharedRealityInheritanceCopiesSettings(t *testing.T) {
+	path := writeTemp(t, `
+kernel:
+  type: xray
+  shared_reality:
+    enabled: true
+instances:
+  - panel:
+      url: https://panel.example.com
+      token: tok
+      node_id: 1
+  - panel:
+      url: https://panel.example.com
+      token: tok
+      node_id: 2
+`)
+	root, err := LoadRoot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, instance := range root.Instances {
+		requireSharedRealitySettings(t, instance.Kernel, sharedRealityTestSettings{true, "0.0.0.0", 443})
+	}
+	// Instance defaults must not mutate the original parent settings.
+	requireSharedRealitySettings(t, root.Kernel, sharedRealityTestSettings{true, "", 0})
+	if err := yaml.Unmarshal([]byte("shared_reality:\n  listen_port: 7443\n"), &root.Instances[0].Kernel); err != nil {
+		t.Fatal(err)
+	}
+	requireSharedRealitySettings(t, root.Instances[0].Kernel, sharedRealityTestSettings{true, "0.0.0.0", 7443})
+	requireSharedRealitySettings(t, root.Instances[1].Kernel, sharedRealityTestSettings{true, "0.0.0.0", 443})
+	requireSharedRealitySettings(t, root.Kernel, sharedRealityTestSettings{true, "", 0})
+}
+
+func TestLoadRootSharedRealityInstanceOverrides(t *testing.T) {
+	path := writeTemp(t, `
+kernel:
+  type: xray
+  shared_reality:
+    enabled: true
+    listen_ip: 192.0.2.10
+    listen_port: 7443
+instances:
+  - panel:
+      url: https://panel.example.com
+      token: tok
+      node_id: 1
+    kernel:
+      type: singbox
+      shared_reality:
+        enabled: false
+        listen_ip: ignored
+        listen_port: -1
+  - panel:
+      url: https://panel.example.com
+      token: tok
+      node_id: 2
+    kernel:
+      shared_reality:
+        enabled: true
+  - panel:
+      url: https://panel.example.com
+      token: tok
+      node_id: 3
+    kernel:
+      shared_reality:
+        enabled: true
+        listen_ip: '::1'
+        listen_port: 8443
+  - panel:
+      url: https://panel.example.com
+      token: tok
+      node_id: 4
+`)
+	root, err := LoadRoot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wants := []sharedRealityTestSettings{
+		{false, "ignored", -1},
+		{true, "0.0.0.0", 443},
+		{true, "::1", 8443},
+		{true, "192.0.2.10", 7443},
+	}
+	for i, want := range wants {
+		requireSharedRealitySettings(t, root.Instances[i].Kernel, want)
+	}
+	if root.Instances[0].Kernel.Type != "singbox" {
+		t.Fatal("explicitly disabled shared_reality must preserve the singbox kernel")
+	}
+	requireSharedRealitySettings(t, root.Kernel, sharedRealityTestSettings{true, "192.0.2.10", 7443})
+}
+
+func TestExpandNodesSharedRealityOverridesAreIndependent(t *testing.T) {
+	path := writeTemp(t, `
+panel:
+  url: https://panel.example.com
+  token: tok
+kernel:
+  type: xray
+  shared_reality:
+    enabled: true
+    listen_ip: 192.0.2.10
+    listen_port: 443
+nodes:
+  - node_id: 1
+  - node_id: 2
+    kernel:
+      log_level: error
+  - node_id: 3
+    kernel:
+      shared_reality:
+        enabled: false
+        listen_ip: ignored
+        listen_port: -1
+  - node_id: 4
+    kernel:
+      shared_reality:
+        enabled: true
+        listen_ip: '::1'
+        listen_port: 8443
+  - node_id: 5
+    kernel:
+      shared_reality:
+        enabled: true
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes := cfg.ExpandNodes()
+	wants := []sharedRealityTestSettings{
+		{true, "192.0.2.10", 443},
+		{true, "192.0.2.10", 443},
+		{false, "ignored", -1},
+		{true, "::1", 8443},
+		{true, "0.0.0.0", 443},
+	}
+	if len(nodes) != len(wants) {
+		t.Fatalf("expanded nodes = %d, want %d", len(nodes), len(wants))
+	}
+	for i, want := range wants {
+		requireSharedRealitySettings(t, nodes[i].Kernel, want)
+	}
+	if err := yaml.Unmarshal([]byte("shared_reality:\n  listen_port: 9443\n"), &nodes[0].Kernel); err != nil {
+		t.Fatal(err)
+	}
+	requireSharedRealitySettings(t, nodes[0].Kernel, sharedRealityTestSettings{true, "192.0.2.10", 9443})
+	requireSharedRealitySettings(t, nodes[1].Kernel, wants[1])
+	requireSharedRealitySettings(t, cfg.Kernel, wants[1])
+	if err := yaml.Unmarshal([]byte("shared_reality:\n  listen_port: 9553\n"), &nodes[3].Kernel); err != nil {
+		t.Fatal(err)
+	}
+	requireSharedRealitySettings(t, nodes[3].Kernel, sharedRealityTestSettings{true, "::1", 9553})
+	requireSharedRealitySettings(t, cfg.Nodes[3].Kernel, wants[3])
+	requireSharedRealitySettings(t, cfg.Nodes[4].Kernel, sharedRealityTestSettings{true, "", 0})
+}
+
+func TestLoadSharedRealityNodeOverrideValidation(t *testing.T) {
+	cases := []struct {
+		name   string
+		kernel string
+		shared string
+		field  string
+	}{
+		{"invalid node IP", "xray", "enabled: true\n        listen_ip: invalid", "listen_ip"},
+		{"negative node port", "xray", "enabled: true\n        listen_port: -1", "listen_port"},
+		{"node port exceeds maximum", "xray", "enabled: true\n        listen_port: 65536", "listen_port"},
+		{"enabled node on singbox", "singbox", "enabled: true", "kernel.type"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeTemp(t, "panel:\n  url: https://panel.example.com\n  token: tok\nkernel:\n  type: "+tc.kernel+"\nnodes:\n  - node_id: 1\n    kernel:\n      shared_reality:\n        "+tc.shared+"\n")
+			for name, load := range map[string]func(string) error{
+				"Load":     func(path string) error { _, err := Load(path); return err },
+				"LoadRoot": func(path string) error { _, err := LoadRoot(path); return err },
+			} {
+				t.Run(name, func(t *testing.T) {
+					err := load(path)
+					if err == nil || !strings.Contains(err.Error(), "nodes[0]") || !strings.Contains(err.Error(), "shared_reality") || !strings.Contains(err.Error(), tc.field) {
+						t.Fatalf("error = %v, want nodes[0] shared_reality %s validation error", err, tc.field)
+					}
+				})
+			}
+		})
 	}
 }

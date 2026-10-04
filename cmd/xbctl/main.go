@@ -72,6 +72,10 @@ type fileInstance struct {
 	Audit      *config.AuditConfig `yaml:"audit,omitempty"`
 	WS         *config.WSConfig    `yaml:"ws,omitempty"`
 	Nodes      []config.NodeEntry  `yaml:"nodes,omitempty"`
+
+	Nodes443      *[]int                   `yaml:"nodes_443,omitempty"`
+	NodesDirect   *[]int                   `yaml:"nodes_direct,omitempty"`
+	NodeOverrides map[int]config.NodeEntry `yaml:"node_overrides,omitempty"`
 }
 
 type filePanelConfig struct {
@@ -94,13 +98,14 @@ type fileNodeConfig struct {
 }
 
 type fileKernelConfig struct {
-	Type         string           `yaml:"type"`
-	ConfigDir    string           `yaml:"config_dir"`
-	LogLevel     string           `yaml:"log_level,omitempty"`
-	GeoDataDir   string           `yaml:"geo_data_dir,omitempty"`
-	CustomConfig string           `yaml:"custom_config,omitempty"`
-	CustomRoute  []map[string]any `yaml:"custom_route,omitempty"`
-	CustomOut    []map[string]any `yaml:"custom_outbound,omitempty"`
+	Type          string                      `yaml:"type"`
+	ConfigDir     string                      `yaml:"config_dir"`
+	LogLevel      string                      `yaml:"log_level,omitempty"`
+	GeoDataDir    string                      `yaml:"geo_data_dir,omitempty"`
+	CustomConfig  string                      `yaml:"custom_config,omitempty"`
+	CustomRoute   []map[string]any            `yaml:"custom_route,omitempty"`
+	CustomOut     []map[string]any            `yaml:"custom_outbound,omitempty"`
+	SharedReality *config.SharedRealityConfig `yaml:"shared_reality,omitempty"`
 }
 
 type fileLogConfig struct {
@@ -851,8 +856,11 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 	if p.Log.Level != "" || p.Log.Output != "" {
 		out.Log = &fileLogConfig{Level: p.Log.Level, Output: p.Log.Output}
 	}
-	if p.Kernel.Type != "" || p.Kernel.LogLevel != "" {
-		out.Kernel = &fileKernelConfig{Type: p.Kernel.Type, LogLevel: p.Kernel.LogLevel}
+	if p.Kernel.Type != "" || p.Kernel.LogLevel != "" || p.Kernel.SharedReality != nil {
+		out.Kernel = &fileKernelConfig{
+			Type: p.Kernel.Type, LogLevel: p.Kernel.LogLevel,
+			SharedReality: p.Kernel.SharedReality,
+		}
 	}
 	if p.Node.PushInterval != 0 || p.Node.PullInterval != 0 || p.Node.TrackInterval != 0 || p.Node.DeviceReportInterval != 0 {
 		out.Node = &fileNodeConfig{
@@ -886,13 +894,14 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 				NodeType: inst.Panel.NodeType,
 			},
 			Kernel: fileKernelConfig{
-				Type:         inst.Kernel.Type,
-				ConfigDir:    inst.Kernel.ConfigDir,
-				LogLevel:     inst.Kernel.LogLevel,
-				GeoDataDir:   inst.Kernel.GeoDataDir,
-				CustomConfig: inst.Kernel.CustomConfig,
-				CustomRoute:  inst.Kernel.CustomRoute,
-				CustomOut:    inst.Kernel.CustomOutbound,
+				Type:          inst.Kernel.Type,
+				ConfigDir:     inst.Kernel.ConfigDir,
+				LogLevel:      inst.Kernel.LogLevel,
+				GeoDataDir:    inst.Kernel.GeoDataDir,
+				CustomConfig:  inst.Kernel.CustomConfig,
+				CustomRoute:   inst.Kernel.CustomRoute,
+				CustomOut:     inst.Kernel.CustomOutbound,
+				SharedReality: inst.Kernel.SharedReality,
 			},
 			Log: fileLogConfig{
 				Level:  inst.Log.Level,
@@ -934,6 +943,16 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 		if len(inst.Nodes) > 0 {
 			fi.Nodes = inst.Nodes
 		}
+		// Pointers retain explicitly empty lists instead of omitting compact mode.
+		if inst.Nodes443 != nil {
+			ids := []int(inst.Nodes443)
+			fi.Nodes443 = &ids
+		}
+		if inst.NodesDirect != nil {
+			ids := []int(inst.NodesDirect)
+			fi.NodesDirect = &ids
+		}
+		fi.NodeOverrides = inst.NodeOverrides
 		out.Instances = append(out.Instances, fi)
 	}
 	data, err := yaml.Marshal(&out)

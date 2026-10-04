@@ -58,3 +58,52 @@
 #       token: "machine-token-2"
 #     log:
 #       level: "debug"   # override for this instance only
+
+# -- Compact per-site node lists with a shared REALITY entry --
+# Use this as an alternative to the instances example above, not alongside it.
+# Keep the panel's original server_port for every node in either list.
+# nodes_443 adds the shared entry; nodes_direct keeps only original listeners.
+# The lists control participation even if an inherited enabled flag differs.
+# Omitted from both lists = not started. IDs must be positive and unique per site.
+# Both lists absent = old panel.node_id / nodes behavior. One empty list is OK
+# when the other contains IDs; an explicitly selected but empty mode is invalid.
+# Do not mix these lists with nonempty nodes, machine, or standalone.
+# With instances present, lists and node_overrides belong inside each instance.
+# Use the panel's node code when available, otherwise its actual node ID.
+# Existing global Short ID uniqueness and padded-byte conflict checks still apply.
+# kernel:
+#   type: xray
+#   shared_reality:
+#     listen_port: 443
+# instances:
+#   - panel:
+#       url: "https://panel-a.example.com"
+#       token_env: "PANEL_A_TOKEN"
+#     kernel:
+#       config_dir: "/etc/xboard-node/site-a"
+#     audit:
+#       site: "site-a"
+#     nodes_443: [101, 102]
+#     nodes_direct: [103]
+#     # Optional exceptions only; the mapping key is the node ID.
+#     # Omit node_id and kernel.shared_reality inside every override.
+#     node_overrides:
+#       102:
+#         kernel:
+#           config_dir: "/etc/xboard-node/site-a/region-special"
+#           geo_data_dir: "/etc/xboard-node/site-a/geo"
+#           custom_config: "/etc/xboard-node/site-a/region-special.json"
+#         cert:
+#           cert_mode: file
+#           cert_file: "/etc/xboard-node/site-a/example.crt"
+#           key_file: "/etc/xboard-node/site-a/example.key"
+#           cert_dir: "/etc/xboard-node/site-a/certs-special"
+#   - panel:
+#       url: "https://panel-b.example.com"
+#       token_env: "PANEL_B_TOKEN"
+#     kernel:
+#       config_dir: "/etc/xboard-node/site-b"
+#     audit:
+#       site: "site-b"
+#     nodes_443: [201, 202]
+#     nodes_direct: []

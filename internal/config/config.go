@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -38,6 +39,12 @@ type Config struct {
 	// one service instance is started per entry. All entries share the same
 	// panel URL/token, kernel type, log settings and runtime tuning.
 	Nodes []NodeEntry `yaml:"nodes,omitempty"`
+	// Compact lists select shared REALITY aliases or original listeners only.
+	// They are instance-local and mutually exclusive with legacy Nodes.
+	Nodes443      NodeIDs         `yaml:"nodes_443,omitempty"`
+	NodesDirect   NodeIDs         `yaml:"nodes_direct,omitempty"`
+	NodeOverrides NodeOverrideMap `yaml:"node_overrides,omitempty"`
+	groupedNodes  []NodeEntry
 
 	// Machine enables machine mode: a single process manages all nodes
 	// bound to this machine on the panel. Nodes are discovered dynamically
@@ -74,13 +81,60 @@ type NodeEntry struct {
 	Cert *CertConfig `yaml:"cert,omitempty"`
 }
 
+type NodeIDs []int
+
+func (ids *NodeIDs) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.SequenceNode {
+		return fmt.Errorf("node lists must be sequences of integer IDs")
+	}
+	for i, item := range node.Content {
+		if !isIntegerNode(item) {
+			return fmt.Errorf("node list[%d] must be an integer ID", i)
+		}
+	}
+	var decoded []int
+	if err := node.Decode(&decoded); err != nil {
+		return err
+	}
+	*ids = NodeIDs(decoded)
+	return nil
+}
+
+type NodeOverrideMap map[int]NodeEntry
+
+func (overrides *NodeOverrideMap) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("node_overrides must be a mapping with integer node IDs")
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if !isIntegerNode(node.Content[i]) {
+			return fmt.Errorf("node_overrides keys must be integer node IDs")
+		}
+	}
+	var decoded map[int]NodeEntry
+	if err := node.Decode(&decoded); err != nil {
+		return err
+	}
+	*overrides = NodeOverrideMap(decoded)
+	return nil
+}
+
+func isIntegerNode(node *yaml.Node) bool {
+	if node.Kind == yaml.AliasNode {
+		node = node.Alias
+	}
+	return node != nil && node.Kind == yaml.ScalarNode && node.ShortTag() == "!!int"
+}
+
 // KernelOverride holds the subset of KernelConfig that is useful to override
-// per-node. Only non-zero fields replace the global value.
+// per-node. Only non-zero fields replace the global value, except a non-nil
+// SharedReality replaces the whole setting, including enabled: false.
 type KernelOverride struct {
-	ConfigDir    string `yaml:"config_dir,omitempty"`
-	GeoDataDir   string `yaml:"geo_data_dir,omitempty"`
-	LogLevel     string `yaml:"log_level,omitempty"`
-	CustomConfig string `yaml:"custom_config,omitempty"`
+	ConfigDir     string               `yaml:"config_dir,omitempty"`
+	GeoDataDir    string               `yaml:"geo_data_dir,omitempty"`
+	LogLevel      string               `yaml:"log_level,omitempty"`
+	CustomConfig  string               `yaml:"custom_config,omitempty"`
+	SharedReality *SharedRealityConfig `yaml:"shared_reality,omitempty"`
 }
 
 // RuntimeConfig tunes Go runtime memory behaviour.
@@ -138,6 +192,10 @@ type KernelConfig struct {
 	AuditSink          audit.Sink `yaml:"-"`
 	ForceProxyProtocol bool       `yaml:"force_proxy_protocol"`
 
+	// SharedReality enables an additional Xray REALITY entry for independent nodes.
+	// nil or enabled: false keeps ordinary listeners unchanged.
+	SharedReality *SharedRealityConfig `yaml:"shared_reality"`
+
 	// DeviceLimitEnforce enables admission enforcement when a user exceeds
 	// their device limit. When false (the default), device IPs are still
 	// tracked and reported to the panel (record-only), but connections are
@@ -185,6 +243,48 @@ type KernelConfig struct {
 	// UDPTimeout maps to sing-box udp_timeout (for example "5m"). Empty means
 	// sing-box default.
 	UDPTimeout string `yaml:"udp_timeout"`
+}
+
+type SharedRealityConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	ListenIP   string `yaml:"listen_ip"`
+	ListenPort int    `yaml:"listen_port"`
+}
+
+func (c *SharedRealityConfig) clone() *SharedRealityConfig {
+	if c == nil {
+		return nil
+	}
+	cloned := *c
+	return &cloned
+}
+
+func (c *SharedRealityConfig) setDefaults() {
+	if c == nil || !c.Enabled {
+		return
+	}
+	if c.ListenIP == "" {
+		c.ListenIP = "0.0.0.0"
+	}
+	if c.ListenPort == 0 {
+		c.ListenPort = 443
+	}
+}
+
+func (c *SharedRealityConfig) validate(kernelType string) error {
+	if c == nil || !c.Enabled {
+		return nil
+	}
+	if kernelType != "xray" {
+		return fmt.Errorf("kernel.shared_reality requires kernel.type 'xray'")
+	}
+	if net.ParseIP(c.ListenIP) == nil {
+		return fmt.Errorf("kernel.shared_reality.listen_ip must be an IP address")
+	}
+	if c.ListenPort < 1 || c.ListenPort > 65535 {
+		return fmt.Errorf("kernel.shared_reality.listen_port must be between 1 and 65535")
+	}
+	return nil
 }
 
 // XrayPolicyConfig mirrors xray-core policy levels.0 fields. All timeout
@@ -281,6 +381,9 @@ func LoadRoot(path string) (*RootConfig, error) {
 
 	rc.applyEnvOverrides()
 	rc.resolveEnvRefs()
+	if err := rc.normalizeNodeGroups(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
 
 	// Compute stable instance IDs early — they're content-based (derived from
 	// panel URL + machine/node ID), so reordering instances in the YAML doesn't
@@ -427,6 +530,9 @@ func Load(path string) (*Config, error) {
 
 	cfg.applyEnvOverrides()
 	cfg.resolveEnvRefs()
+	if err := cfg.normalizeNodeGroups(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
 	cfg.setDefaultsFrom(baseDir)
 
 	if err := cfg.validate(); err != nil {
@@ -600,6 +706,9 @@ func (c *Config) inheritFrom(parent *Config) {
 	if c.Kernel.Type == "" {
 		c.Kernel.Type = parent.Kernel.Type
 	}
+	if c.Kernel.SharedReality == nil {
+		c.Kernel.SharedReality = parent.Kernel.SharedReality.clone()
+	}
 	if c.Kernel.LogLevel == "" {
 		c.Kernel.LogLevel = parent.Kernel.LogLevel
 	}
@@ -685,6 +794,7 @@ func (c *Config) setDefaultsFrom(baseDir string) {
 	if c.Kernel.Type == "" {
 		c.Kernel.Type = "singbox"
 	}
+	c.Kernel.SharedReality.setDefaults()
 	if c.Kernel.ConfigDir == "" {
 		c.Kernel.ConfigDir = baseDir
 	}
@@ -738,6 +848,113 @@ func (c *Config) IsMachineMode() bool {
 	return c.Machine != nil && c.Machine.MachineID > 0
 }
 
+func (c *Config) hasNodeGroups() bool {
+	return c.Nodes443 != nil || c.NodesDirect != nil
+}
+
+func (c *Config) nodeEntries() []NodeEntry {
+	if c.hasNodeGroups() {
+		return c.groupedNodes
+	}
+	return c.Nodes
+}
+
+func (rc *RootConfig) normalizeNodeGroups() error {
+	if len(rc.Instances) == 0 {
+		return rc.Config.normalizeNodeGroups()
+	}
+	if rc.Config.hasNodeGroups() || rc.Config.NodeOverrides != nil {
+		return fmt.Errorf("nodes_443, nodes_direct and node_overrides must be inside instances in multi-instance mode")
+	}
+	for i := range rc.Instances {
+		if err := rc.Instances[i].normalizeNodeGroups(); err != nil {
+			return fmt.Errorf("instances[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+func (c *Config) normalizeNodeGroups() error {
+	if !c.hasNodeGroups() {
+		if c.NodeOverrides != nil {
+			return fmt.Errorf("node_overrides requires nodes_443 or nodes_direct")
+		}
+		return nil
+	}
+	if len(c.Nodes) > 0 {
+		return fmt.Errorf("nodes cannot be combined with nodes_443 or nodes_direct")
+	}
+	if c.IsMachineMode() || c.IsStandalone() {
+		return fmt.Errorf("nodes_443 and nodes_direct cannot be combined with machine or standalone mode")
+	}
+	if len(c.Nodes443)+len(c.NodesDirect) == 0 {
+		return fmt.Errorf("nodes_443 and nodes_direct must contain at least one node")
+	}
+	groups := []struct {
+		name    string
+		ids     []int
+		enabled bool
+	}{
+		{"nodes_443", c.Nodes443, true},
+		{"nodes_direct", c.NodesDirect, false},
+	}
+	seen := make(map[int]string, len(c.Nodes443)+len(c.NodesDirect))
+	for _, group := range groups {
+		for i, id := range group.ids {
+			if id <= 0 {
+				return fmt.Errorf("%s[%d] must be positive", group.name, i)
+			}
+			if previous, ok := seen[id]; ok {
+				return fmt.Errorf("%s[%d]: duplicate node_id %d already present in %s", group.name, i, id, previous)
+			}
+			seen[id] = group.name
+		}
+	}
+	overrideIDs := make([]int, 0, len(c.NodeOverrides))
+	for id := range c.NodeOverrides {
+		overrideIDs = append(overrideIDs, id)
+	}
+	sort.Ints(overrideIDs)
+	for _, id := range overrideIDs {
+		if id <= 0 {
+			return fmt.Errorf("node_overrides keys must be positive")
+		}
+		if _, ok := seen[id]; !ok {
+			return fmt.Errorf("node_overrides[%d] must refer to a node in nodes_443 or nodes_direct", id)
+		}
+		override := c.NodeOverrides[id]
+		if override.NodeID != 0 {
+			return fmt.Errorf("node_overrides[%d].node_id must be omitted; use the mapping key", id)
+		}
+		if override.Kernel != nil && override.Kernel.SharedReality != nil {
+			return fmt.Errorf("node_overrides[%d].kernel.shared_reality is controlled by the node lists and kernel.shared_reality", id)
+		}
+	}
+	entries := make([]NodeEntry, 0, len(seen))
+	for _, group := range groups {
+		for _, id := range group.ids {
+			entry := c.NodeOverrides[id]
+			entry.NodeID = id
+			if entry.Kernel == nil {
+				entry.Kernel = &KernelOverride{}
+			} else {
+				cloned := *entry.Kernel
+				entry.Kernel = &cloned
+			}
+			shared := c.Kernel.SharedReality.clone()
+			if shared == nil {
+				shared = &SharedRealityConfig{}
+			}
+			shared.Enabled = group.enabled
+			entry.Kernel.SharedReality = shared
+			entries = append(entries, entry)
+		}
+	}
+	// Keep generated entries private so YAML round trips retain the short lists.
+	c.groupedNodes = entries
+	return nil
+}
+
 // panelHost returns the lowercase host name of a panel URL without port or
 // trailing dot, or "" when the URL has no host.
 func panelHost(raw string) string {
@@ -749,6 +966,12 @@ func panelHost(raw string) string {
 }
 
 func (c *Config) AutoInstanceID() (string, error) {
+	if c.hasNodeGroups() && c.groupedNodes == nil {
+		if err := c.normalizeNodeGroups(); err != nil {
+			return "", err
+		}
+	}
+	entries := c.nodeEntries()
 	mode := "node"
 	target := "0"
 	baseURL := strings.TrimSpace(c.Panel.URL)
@@ -759,10 +982,10 @@ func (c *Config) AutoInstanceID() (string, error) {
 	} else if c.IsMachineMode() {
 		mode = "machine"
 		target = strconv.Itoa(c.Machine.MachineID)
-	} else if len(c.Nodes) > 0 {
+	} else if len(entries) > 0 {
 		// Multi-node mode: include sorted node IDs in the hash to avoid collisions.
-		ids := make([]string, len(c.Nodes))
-		for i, n := range c.Nodes {
+		ids := make([]string, len(entries))
+		for i, n := range entries {
 			ids[i] = strconv.Itoa(n.NodeID)
 		}
 		sort.Strings(ids)
@@ -829,6 +1052,7 @@ func normalizeBaseURL(raw string) (string, string, error) {
 }
 
 func (c *Config) validate() error {
+	entries := c.nodeEntries()
 	if c.Audit.URL != "" {
 		if c.Audit.Secret == "" {
 			return fmt.Errorf("audit.secret (or secret_env) is required when audit.url is configured")
@@ -860,7 +1084,7 @@ func (c *Config) validate() error {
 		if c.Machine.Token == "" {
 			return fmt.Errorf("machine.token is required")
 		}
-		if len(c.Nodes) > 0 {
+		if len(entries) > 0 {
 			return fmt.Errorf("machine mode and nodes: are mutually exclusive")
 		}
 	} else {
@@ -871,10 +1095,10 @@ func (c *Config) validate() error {
 			return fmt.Errorf("panel.token is required")
 		}
 		// In multi-node mode panel.node_id is optional; validate each NodeEntry instead.
-		if len(c.Nodes) == 0 && c.Panel.NodeID <= 0 {
-			return fmt.Errorf("panel.node_id must be positive (or use 'nodes:' for multi-node)")
+		if len(entries) == 0 && c.Panel.NodeID <= 0 {
+			return fmt.Errorf("panel.node_id must be positive (or use nodes, nodes_443 or nodes_direct for multi-node)")
 		}
-		for i, n := range c.Nodes {
+		for i, n := range entries {
 			if n.NodeID <= 0 {
 				return fmt.Errorf("nodes[%d].node_id must be positive", i)
 			}
@@ -884,6 +1108,21 @@ func (c *Config) validate() error {
 	case "singbox", "xray":
 	default:
 		return fmt.Errorf("kernel.type must be 'singbox' or 'xray', got '%s'", c.Kernel.Type)
+	}
+	if !c.hasNodeGroups() {
+		if err := c.Kernel.SharedReality.validate(c.Kernel.Type); err != nil {
+			return err
+		}
+	}
+	for i, entry := range entries {
+		if entry.Kernel == nil || entry.Kernel.SharedReality == nil {
+			continue
+		}
+		shared := entry.Kernel.SharedReality.clone()
+		shared.setDefaults()
+		if err := shared.validate(c.Kernel.Type); err != nil {
+			return fmt.Errorf("nodes[%d]: %w", i, err)
+		}
 	}
 	if c.Cert.AutoTLS && c.Cert.Domain == "" {
 		return fmt.Errorf("cert.domain is required when cert.auto_tls is enabled")
@@ -902,19 +1141,28 @@ func (c *Config) validate() error {
 // Multi-node mode: returns one derived *Config per NodeEntry, each inheriting
 // shared settings and applying per-node overrides.
 func (c *Config) ExpandNodes() []*Config {
-	if len(c.Nodes) == 0 {
+	entries := c.nodeEntries()
+	if len(entries) == 0 {
 		return []*Config{c}
 	}
 
-	result := make([]*Config, 0, len(c.Nodes))
-	for _, entry := range c.Nodes {
-		nodeCfg := *c // shallow copy — safe because slices/maps are not mutated
+	result := make([]*Config, 0, len(entries))
+	for _, entry := range entries {
+		nodeCfg := *c // Slices/maps are not mutated; copy mutable listener settings below.
+		nodeCfg.Kernel.SharedReality = c.Kernel.SharedReality.clone()
 		nodeCfg.Nodes = nil
+		nodeCfg.Nodes443 = nil
+		nodeCfg.NodesDirect = nil
+		nodeCfg.NodeOverrides = nil
+		nodeCfg.groupedNodes = nil
 		nodeCfg.Panel.NodeID = entry.NodeID
 		nodeCfg.Panel.NodeType = entry.NodeType
 
 		// Per-node kernel overrides
 		if entry.Kernel != nil {
+			if entry.Kernel.SharedReality != nil {
+				nodeCfg.Kernel.SharedReality = entry.Kernel.SharedReality.clone()
+			}
 			if entry.Kernel.ConfigDir != "" {
 				nodeCfg.Kernel.ConfigDir = entry.Kernel.ConfigDir
 				if nodeCfg.Kernel.GeoDataDir == c.Kernel.ConfigDir {
@@ -932,7 +1180,8 @@ func (c *Config) ExpandNodes() []*Config {
 			if entry.Kernel.CustomConfig != "" {
 				nodeCfg.Kernel.CustomConfig = entry.Kernel.CustomConfig
 			}
-		} else {
+		}
+		if entry.Kernel == nil || (c.hasNodeGroups() && entry.Kernel.ConfigDir == "") {
 			// Auto-derive a unique config_dir per node to avoid conflicts.
 			nodeCfg.Kernel.ConfigDir = fmt.Sprintf("%s/node-%d", c.Kernel.ConfigDir, entry.NodeID)
 			if nodeCfg.Kernel.GeoDataDir == c.Kernel.ConfigDir {
@@ -940,6 +1189,8 @@ func (c *Config) ExpandNodes() []*Config {
 				nodeCfg.Kernel.GeoDataDir = c.Kernel.GeoDataDir
 			}
 		}
+
+		nodeCfg.Kernel.SharedReality.setDefaults()
 
 		// Per-node cert overrides
 		if entry.Cert != nil {

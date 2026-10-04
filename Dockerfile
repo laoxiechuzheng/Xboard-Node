@@ -10,7 +10,9 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 go build -ldflags "-s -w \
+RUN go run ./tools/xray-task-overlay
+
+RUN CGO_ENABLED=0 go build -mod=readonly -modfile=/build/.xray-task-overlay/build.mod -overlay=/build/.xray-task-overlay/overlay.json -ldflags "-s -w \
     -X main.version=$(git describe --tags --always --dirty 2>/dev/null || echo dev) \
     -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     -tags "with_quic with_utls with_wireguard with_clash_api" \

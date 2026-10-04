@@ -21,6 +21,7 @@ Thumbs.db
 
 # Go
 vendor/
+.xray-task-overlay/
 config.json
 benchmark/
 third_party

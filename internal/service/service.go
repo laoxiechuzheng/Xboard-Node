@@ -65,6 +65,7 @@ type Service struct {
 	// pushActive prevents overlapping push/pull goroutines.
 	pushActive atomic.Bool
 	pullActive atomic.Bool
+	pushWG     sync.WaitGroup
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
 
@@ -205,7 +206,12 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.initialSetup(ctx); err != nil {
 		return fmt.Errorf("initial setup: %w", err)
 	}
-	defer s.kernel.Stop()
+	kernelStopped := false
+	defer func() {
+		if !kernelStopped {
+			s.kernel.Stop()
+		}
+	}()
 
 	// Set up tickers
 	trackTicker := time.NewTicker(time.Duration(s.cfg.Node.TrackInterval) * time.Second)
@@ -231,6 +237,17 @@ func (s *Service) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			if s.sharedRealityBillingEnabled() {
+				s.kernel.Stop()
+				kernelStopped = true
+				// Shared Xray retains its final cumulative ledger after draining.
+				traffic, aliveIPs, connCount, err := s.kernel.GetUserTraffic(context.Background())
+				if err != nil {
+					nlog.Core().Warn("failed to collect final shared REALITY traffic", "error", err)
+				} else {
+					s.tracker.Process(traffic, aliveIPs, connCount)
+				}
+			}
 			s.pushReportSync()
 			return nil
 
@@ -1027,7 +1044,7 @@ func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged 
 }
 
 func (s *Service) trackAndEnforce(ctx context.Context) {
-	if !s.kernel.IsRunning() {
+	if !s.kernel.IsRunning() && !s.sharedRealityBillingEnabled() {
 		return
 	}
 
@@ -1065,6 +1082,7 @@ func (s *Service) pushReportAsync() {
 		return
 	}
 
+	s.pushWG.Add(1)
 	traffic := s.tracker.FlushTraffic()
 	aliveIPs := s.tracker.FlushAliveIPs()
 	online := s.tracker.CurrentOnline()
@@ -1073,6 +1091,7 @@ func (s *Service) pushReportAsync() {
 	metrics["kernel_status"] = s.kernel.IsRunning()
 
 	go func() {
+		defer s.pushWG.Done()
 		defer s.pushActive.Store(false)
 		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
 			nlog.Core().Warn("failed to push report", "error", err)
@@ -1090,10 +1109,24 @@ func (s *Service) pushReportAsync() {
 	}()
 }
 
+func (s *Service) sharedRealityBillingEnabled() bool {
+	if s.cfg == nil || cfgKernelType(s.cfg) != "xray" || s.cfg.Kernel.SharedReality == nil || !s.cfg.Kernel.SharedReality.Enabled {
+		return false
+	}
+	spec := s.appliedState.Config
+	return spec != nil && spec.Protocol == "vless" && spec.TLS == 2 &&
+		(spec.Network == "" || spec.Network == "tcp" || spec.Network == "raw") && !spec.GetProxyProtocol()
+}
+
 // pushReportSync is used only during shutdown to ensure final data is sent.
 func (s *Service) pushReportSync() {
 	if !s.sink.SupportsReporting() {
 		return
+	}
+	shared := s.sharedRealityBillingEnabled()
+	if shared {
+		// An unsuccessful in-flight report must restore its data before flushing.
+		s.pushWG.Wait()
 	}
 	traffic := s.tracker.FlushTraffic()
 	aliveIPs := s.tracker.FlushAliveIPs()
@@ -1104,6 +1137,10 @@ func (s *Service) pushReportSync() {
 
 	if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
 		nlog.Core().Warn("failed to push final report", "error", err)
+		if shared {
+			s.tracker.RestoreTraffic(traffic)
+			s.tracker.RestoreAliveIPs(aliveIPs)
+		}
 	}
 }
 

@@ -1,0 +1,9 @@
+.xray-task-overlay
+release
+config.yml
+config.json
+.env
+xboard-node
+xbctl
+xboard-node-linux-*
+xbctl-linux-*

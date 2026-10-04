@@ -53,22 +53,27 @@ const (
 //   - instance.Start() and instance.Close() run OUTSIDE the lock.
 //   - running (atomic) gates fast-path checks in IsRunning / GetConnections.
 type Xray struct {
-	cfg config.KernelConfig
+	cfg         config.KernelConfig
+	lifecycleMu sync.Mutex
 
 	// mu protects instance, limitDispatcher, users, protocol, inboundTag,
 	// lastKernelHash, and cumTraffic. Never held during slow I/O.
-	mu              sync.Mutex
-	instance        *xrayCore.Instance
-	limitDispatcher *LimitDispatcher
-	users           []model.UserSpec
-	nodeConfig      *model.NodeSpec
-	tls             kernel.TLSCert
-	protocol        string
-	inboundTag      string
-	lastKernelHash  string
-	cumTraffic      map[int][2]int64
-	speedLimitFunc  func(string) *rate.Limiter
-	audit           *auditLogger
+	mu               sync.Mutex
+	instance         *xrayCore.Instance
+	limitDispatcher  *LimitDispatcher
+	users            []model.UserSpec
+	nodeConfig       *model.NodeSpec
+	tls              kernel.TLSCert
+	protocol         string
+	inboundTag       string
+	lastKernelHash   string
+	cumTraffic       map[int][2]int64
+	speedLimitFunc   func(string) *rate.Limiter
+	audit            *auditLogger
+	sharedRuntime    *sharedRealityRuntime
+	sharedStatsUsers map[int]struct{}
+	sharedRetired    []*sharedRealityGeneration
+	sharedLedger     atomic.Bool
 
 	// running is set after a successful Start and cleared before shutdown.
 	// Atomic so IsRunning / GetConnections never block.
@@ -118,6 +123,17 @@ func (x *Xray) Protocols() []string {
 //	Phase 4 – Swap:       store new, extract old     (brief kernel lock)
 //	Phase 5 – RecycleOld: close old in background    (non-blocking)
 func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
+	x.lifecycleMu.Lock()
+	defer x.lifecycleMu.Unlock()
+	aliasNode := x.sharedRealityEnabled() && isSharedRealityNode(nodeConfig)
+	if aliasNode {
+		if err := validateSharedRealityNode(nodeConfig); err != nil {
+			return err
+		}
+		if !sharedRealityNativeTasksAvailable() {
+			return fmt.Errorf("shared REALITY requires the native task overlay; build with Makefile or Dockerfile")
+		}
+	}
 	// ── Phase 1: Build config (no shared state) ─────────────────────────
 	x.ensureGeoData(nodeConfig)
 
@@ -128,15 +144,33 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 
 	pbConfig, err := serial.LoadJSONConfig(bytes.NewReader(data))
 	if err != nil {
+		if aliasNode {
+			return fmt.Errorf("parse shared REALITY xray config: invalid configuration (credential details suppressed)")
+		}
 		return fmt.Errorf("parse xray config: %w", err)
+	}
+	var sharedRuntime *sharedRealityRuntime
+	if aliasNode {
+		sharedRuntime, err = x.prepareSharedReality(pbConfig)
+		if err != nil {
+			return err
+		}
+		defer sharedRealityPending.Delete(sharedRuntime.token)
 	}
 
 	// ── Phase 2: Create instance (global lock for LD capture) ───────────
 	xrayCreationMu.Lock()
-	inst, err := xrayCore.New(pbConfig)
+	ctx := context.Background()
+	if sharedRuntime != nil {
+		ctx = context.WithValue(ctx, sharedRealityContextKey{}, sharedRuntime)
+	}
+	inst, err := xrayCore.NewWithContext(ctx, pbConfig)
 	ld := globalLimitDispatcher.Load()
 	xrayCreationMu.Unlock()
 	if err != nil {
+		if sharedRuntime != nil {
+			return fmt.Errorf("create shared REALITY xray core: invalid configuration (credential details suppressed)")
+		}
 		return fmt.Errorf("create xray: %w", err)
 	}
 	x.configureDispatcher(ld, nodeConfig, users)
@@ -149,8 +183,16 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 
 	// ── Phase 4: Swap old → new (brief kernel lock) ─────────────────────
 	x.mu.Lock()
+	if aliasNode {
+		x.sharedLedger.Store(true)
+	}
 	old := x.instance
 	oldLD := x.limitDispatcher
+	var retired *sharedRealityGeneration
+	if x.sharedRealityLedgerEnabled() && old != nil {
+		retired = &sharedRealityGeneration{instance: old, dispatcher: oldLD, runtime: x.sharedRuntime, users: x.sharedUserIDsLocked()}
+		x.sharedRetired = append(x.sharedRetired, retired)
+	}
 	x.instance = inst
 	x.limitDispatcher = ld
 	x.users = users
@@ -158,13 +200,30 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	x.tls = tls
 	x.protocol = nodeConfig.Protocol
 	x.inboundTag = nodeConfig.Protocol + "-in"
-	x.cumTraffic = make(map[int][2]int64)
+	if !x.sharedRealityLedgerEnabled() {
+		x.cumTraffic = make(map[int][2]int64)
+	} else {
+		x.sharedRuntime = sharedRuntime
+		x.sharedStatsUsers = make(map[int]struct{}, len(users))
+		for _, user := range users {
+			x.sharedStatsUsers[user.ID] = struct{}{}
+		}
+	}
 	x.lastKernelHash = kernel.ComputeHash(nodeConfig, users)
 	x.running.Store(true)
+	if sharedRuntime != nil {
+		sharedRuntime.lease.activate()
+	} else if retired != nil && retired.runtime != nil && retired.runtime.lease != nil {
+		retired.runtime.lease.Close()
+	}
 	x.mu.Unlock()
 
 	// ── Phase 5: Recycle old (background, non-blocking) ─────────────────
-	closeOld(old, oldLD)
+	if retired != nil {
+		go x.retireSharedReality(retired)
+	} else {
+		closeOld(old, oldLD)
+	}
 
 	x.updateBandwidthLimits(users)
 
@@ -200,6 +259,12 @@ func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ke
 
 // Stop gracefully shuts down the kernel, draining active connections first.
 func (x *Xray) Stop() {
+	x.lifecycleMu.Lock()
+	defer x.lifecycleMu.Unlock()
+	if x.sharedRealityLedgerEnabled() {
+		x.stopSharedReality()
+		return
+	}
 	x.running.Store(false)
 
 	x.mu.Lock()
@@ -228,20 +293,42 @@ func tlsEqual(a, b kernel.TLSCert) bool {
 // available. The dispatcher intentionally no longer wraps transport links,
 // so traffic accounting must come from xray-core itself.
 func (x *Xray) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error) {
-	if !x.running.Load() {
+	if !x.running.Load() && !x.sharedRealityLedgerEnabled() {
 		return nil, nil, 0, nil
 	}
 
 	x.mu.Lock()
-	ld := x.limitDispatcher
+	dispatchers := []*LimitDispatcher{x.limitDispatcher}
+	if x.sharedRealityLedgerEnabled() {
+		for _, generation := range x.sharedRetired {
+			dispatchers = append(dispatchers, generation.dispatcher)
+		}
+	}
 	traffic, err = x.aggregateStats()
 	x.mu.Unlock()
 	if err != nil {
 		return nil, nil, 0, err
 	}
 
-	if ld != nil {
-		aliveIPs, connCount = ld.GetConnectionState()
+	for _, ld := range dispatchers {
+		if ld == nil {
+			continue
+		}
+		ips, count := ld.GetConnectionState()
+		connCount += count
+		if aliveIPs == nil {
+			aliveIPs = ips
+			continue
+		}
+		for id, addresses := range ips {
+			if aliveIPs[id] == nil {
+				aliveIPs[id] = addresses
+				continue
+			}
+			for address, active := range addresses {
+				aliveIPs[id][address] = active
+			}
+		}
 	}
 	return traffic, aliveIPs, connCount, nil
 }
@@ -288,6 +375,10 @@ func (x *Xray) ClearGlobalDevices() {}
 // existing users, so this method always merges properties and refreshes the
 // dispatcher limits — even when no brand-new users need to be added.
 func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
+	if x.sharedRealityLedgerEnabled() {
+		x.lifecycleMu.Lock()
+		defer x.lifecycleMu.Unlock()
+	}
 	x.mu.Lock()
 	if x.instance == nil {
 		x.mu.Unlock()
@@ -322,6 +413,10 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 
 	um, err := x.getUserManager()
 	if err != nil {
+		if x.sharedRealityLedgerEnabled() {
+			x.mu.Unlock()
+			return 0, err
+		}
 		// Protocol doesn't support UserManager → full restart
 		nc, t := x.nodeConfig, x.tls
 		x.mu.Unlock()
@@ -354,6 +449,11 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	// Update bookkeeping with full merged list (new users + updated properties).
 	x.mu.Lock()
 	x.users = merged
+	if x.sharedRealityLedgerEnabled() {
+		for _, user := range merged {
+			x.sharedStatsUsers[user.ID] = struct{}{}
+		}
+	}
 	x.mu.Unlock()
 	x.updateDispatcherLimits(merged)
 	x.updateBandwidthLimits(merged)
@@ -365,6 +465,10 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 // RemoveUsers removes users from the running kernel via xray's UserManager API.
 // Truly hitless for supported protocols — remaining connections unaffected.
 func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
+	if x.sharedRealityLedgerEnabled() {
+		x.lifecycleMu.Lock()
+		defer x.lifecycleMu.Unlock()
+	}
 	x.mu.Lock()
 	if x.instance == nil {
 		x.mu.Unlock()
@@ -388,7 +492,7 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 		return 0, nil
 	}
 
-	if len(kept) == 0 {
+	if len(kept) == 0 && !x.sharedRealityLedgerEnabled() {
 		x.mu.Unlock()
 		x.Stop()
 		return removed, nil
@@ -396,6 +500,10 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 
 	um, err := x.getUserManager()
 	if err != nil {
+		if x.sharedRealityLedgerEnabled() {
+			x.mu.Unlock()
+			return 0, err
+		}
 		nc, t := x.nodeConfig, x.tls
 		x.mu.Unlock()
 		nlog.Core().Debug("xray: RemoveUsers fallback to restart", "reason", err)
@@ -431,6 +539,10 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 // changed, updates the dispatcher without restarting. Otherwise uses
 // UserManager for hitless add/remove where supported.
 func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err error) {
+	if x.sharedRealityLedgerEnabled() {
+		x.lifecycleMu.Lock()
+		defer x.lifecycleMu.Unlock()
+	}
 	x.mu.Lock()
 	if x.instance == nil {
 		x.mu.Unlock()
@@ -451,6 +563,10 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 
 	um, umErr := x.getUserManager()
 	if umErr != nil {
+		if x.sharedRealityLedgerEnabled() {
+			x.mu.Unlock()
+			return 0, 0, umErr
+		}
 		// Protocol doesn't support UserManager → full restart
 		nc, t := x.nodeConfig, x.tls
 		x.mu.Unlock()
@@ -487,6 +603,11 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 
 	x.mu.Lock()
 	x.users = users
+	if x.sharedRealityLedgerEnabled() {
+		for _, user := range users {
+			x.sharedStatsUsers[user.ID] = struct{}{}
+		}
+	}
 	x.mu.Unlock()
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
@@ -645,6 +766,14 @@ func (x *Xray) ensureGeoData(nc *model.NodeSpec) {
 // marshalConfig builds the xray JSON config and returns the raw bytes.
 func marshalConfig(cfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) ([]byte, error) {
 	cfgMap := buildConfig(cfg, nc, users, tls)
+	if cfg.SharedReality != nil && cfg.SharedReality.Enabled && isSharedRealityNode(nc) {
+		// Accounting is mandatory for aliases, even with custom policy files.
+		policy := cfgMap["policy"].(M)
+		levels := policy["levels"].(M)
+		level := levels["0"].(M)
+		level["statsUserUplink"] = true
+		level["statsUserDownlink"] = true
+	}
 	data, err := json.MarshalIndent(cfgMap, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)
@@ -709,6 +838,9 @@ func drainConns(ld *LimitDispatcher, timeout time.Duration) {
 // when LimitDispatcher is not available. Returns per-user cumulative traffic.
 // Must be called with x.mu held.
 func (x *Xray) aggregateStats() (map[int][2]int64, error) {
+	if x.sharedRealityLedgerEnabled() {
+		return x.aggregateSharedRealityStatsLocked(), nil
+	}
 	sm := x.instance.GetFeature(stats.ManagerType())
 	if sm == nil {
 		return nil, nil
