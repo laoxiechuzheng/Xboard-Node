@@ -484,7 +484,9 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert,
 			base["proxy_protocol"] = true
 			base["proxy_protocol_accept_no_header"] = true
 		}
-		return buildAnyTLS(base, nc, users, tc)
+		inbound := buildAnyTLS(base, nc, users, tc)
+		applySNIWhitelist(inbound, kcfgs)
+		return inbound
 	case "naive":
 		return buildNaive(base, nc, users, tc)
 	case "socks":
@@ -499,7 +501,7 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert,
 }
 
 // applySNIWhitelist makes the inbound reject TLS handshakes whose SNI is not in
-// kernel.sni_whitelist. Without TLS the QUIC inbound cannot start at all.
+// kernel.sni_whitelist. Without TLS these inbounds cannot start at all.
 func applySNIWhitelist(inbound M, kcfgs []config.KernelConfig) {
 	if len(kcfgs) == 0 || len(kcfgs[0].SNIWhitelist) == 0 {
 		return

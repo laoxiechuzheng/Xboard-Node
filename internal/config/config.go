@@ -246,7 +246,7 @@ type KernelConfig struct {
 	UDPTimeout string `yaml:"udp_timeout"`
 
 	// SNIWhitelist restricts the TLS server names (SNI) accepted by sing-box
-	// Hysteria2 and TUIC inbounds. A handshake without SNI or with an unlisted
+	// Hysteria2, TUIC and AnyTLS inbounds. A handshake without SNI or with an unlisted
 	// one is rejected even if the client skips certificate verification.
 	// Empty = no restriction.
 	SNIWhitelist ServerNameList `yaml:"sni_whitelist,omitempty"`

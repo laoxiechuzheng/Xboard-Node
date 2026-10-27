@@ -9,7 +9,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/panel"
 )
 
-func TestBuildInboundSNIWhitelistOnlyForHysteria2AndTUIC(t *testing.T) {
+func TestBuildInboundSNIWhitelistOnlyForHysteria2TUICAndAnyTLS(t *testing.T) {
 	cert := kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")}
 	whitelist := config.ServerNameList{"iosapps.itunes.apple.com", "www.apple.com"}
 	kcfg := config.KernelConfig{SNIWhitelist: whitelist}
@@ -23,7 +23,8 @@ func TestBuildInboundSNIWhitelistOnlyForHysteria2AndTUIC(t *testing.T) {
 		{&panel.NodeConfig{Protocol: "tuic", ServerPort: 8443}, true},
 		{&panel.NodeConfig{Protocol: "hysteria", Version: 1, ServerPort: 8443}, false},
 		{&panel.NodeConfig{Protocol: "trojan", ServerPort: 8443}, false},
-		{&panel.NodeConfig{Protocol: "anytls", ServerPort: 8443}, false},
+		{&panel.NodeConfig{Protocol: "anytls", ServerPort: 8443}, true},
+		{&panel.NodeConfig{Protocol: "anytls", ServerPort: 8443, AcceptProxyProtocol: true}, true},
 	} {
 		t.Run(tc.node.Protocol, func(t *testing.T) {
 			inbound := buildInbound(testNodeSpec(tc.node), testUsers, cert, kcfg)

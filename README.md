@@ -104,9 +104,9 @@ servers with a firewall or private network. An untrusted peer can otherwise forg
 The forwarder must send its PROXY header before the original TLS handshake; no client-side setting is needed.
 Enabling this configuration requires restarting the target node process. No panel/database change is required.
 
-### Hysteria2 / TUIC SNI whitelist
+### Hysteria2 / TUIC / AnyTLS SNI whitelist
 
-The sing-box Hysteria2 and TUIC (v5) inbounds can be restricted to a fixed set of TLS server names (SNI):
+The sing-box Hysteria2, TUIC (v5) and AnyTLS inbounds can be restricted to a fixed set of TLS server names (SNI):
 
 ```yaml
 kernel:
@@ -114,12 +114,13 @@ kernel:
   sni_whitelist: "iosapps.itunes.apple.com,apple.com,www.apple.com"   # or a YAML list
 ```
 
-A QUIC handshake whose ClientHello has no SNI or an unlisted one is rejected by the server before any
-certificate is sent, so it fails even when the client enables `skip-cert-verify` / `allow_insecure`.
+A TLS handshake (QUIC for Hysteria2/TUIC, TCP for AnyTLS) whose ClientHello has no SNI or an unlisted one
+is rejected by the server before any certificate is sent, so it fails even when the client enables
+`skip-cert-verify` / `allow_insecure`.
 Rejected handshakes never authenticate a user, so they are not routed, billed, device-tracked or audited.
 Names match case-insensitively and exactly; `*.example.com` matches any subdomain but not `example.com`.
 
-- Only Hysteria2 and TUIC inbounds are affected; Hysteria v1, VLESS, Trojan, AnyTLS and others are unchanged.
+- Only Hysteria2, TUIC and AnyTLS inbounds are affected; Hysteria v1, VLESS, Trojan and others are unchanged.
 - In multi-instance configs the top-level value is inherited; an instance or a node entry
   (`nodes[].kernel.sni_whitelist`, or `node_overrides`) may set its own list, which replaces the inherited one.
 - Every SNI the panel hands to clients for these nodes (the node's TLS `server_name`, including alias
