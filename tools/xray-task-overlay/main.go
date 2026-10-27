@@ -49,9 +49,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// go list -m reports Dir only for modules already in the module cache,
+	// which is empty on a fresh CI runner.
+	var stderr bytes.Buffer
+	download := exec.Command("go", "mod", "download", xrayModulePath)
+	download.Dir = projectDir
+	download.Stderr = &stderr
+	if err := download.Run(); err != nil {
+		return fmt.Errorf("download Xray module: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	stderr.Reset()
 	cmd := exec.Command("go", "list", "-mod=readonly", "-m", "-json", xrayModulePath)
 	cmd.Dir = projectDir
-	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	moduleJSON, err := cmd.Output()
 	if err != nil {
