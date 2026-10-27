@@ -28,6 +28,10 @@
 #   #   tcp_keep_alive: "15m"          # optional sing-box listen option
 #   #   tcp_keep_alive_interval: "30s" # optional sing-box listen option
 #   #   udp_timeout: "5m"               # optional sing-box listen option
+#   #   sni_whitelist: "iosapps.itunes.apple.com,www.apple.com"
+#   #                                   # sing-box Hysteria2/TUIC only: reject
+#   #                                   # handshakes with any other SNI, even
+#   #                                   # from skip-cert-verify clients.
 #   #   device_limit_enforce: false     # default false: device IPs are still
 #   #                                   # tracked & reported, but over-limit
 #   #                                   # users are never rejected. Set true to

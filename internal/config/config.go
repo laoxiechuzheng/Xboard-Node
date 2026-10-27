@@ -135,6 +135,7 @@ type KernelOverride struct {
 	LogLevel      string               `yaml:"log_level,omitempty"`
 	CustomConfig  string               `yaml:"custom_config,omitempty"`
 	SharedReality *SharedRealityConfig `yaml:"shared_reality,omitempty"`
+	SNIWhitelist  ServerNameList       `yaml:"sni_whitelist,omitempty"`
 }
 
 // RuntimeConfig tunes Go runtime memory behaviour.
@@ -243,6 +244,79 @@ type KernelConfig struct {
 	// UDPTimeout maps to sing-box udp_timeout (for example "5m"). Empty means
 	// sing-box default.
 	UDPTimeout string `yaml:"udp_timeout"`
+
+	// SNIWhitelist restricts the TLS server names (SNI) accepted by sing-box
+	// Hysteria2 and TUIC inbounds. A handshake without SNI or with an unlisted
+	// one is rejected even if the client skips certificate verification.
+	// Empty = no restriction.
+	SNIWhitelist ServerNameList `yaml:"sni_whitelist,omitempty"`
+}
+
+// ServerNameList holds TLS server names. YAML accepts a comma-separated string
+// ("a.com,b.com") or a sequence; entries are trimmed and lower-cased.
+// "*.example.com" matches any subdomain of example.com.
+type ServerNameList []string
+
+func (l *ServerNameList) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.AliasNode {
+		node = node.Alias
+	}
+	var raw []string
+	switch node.Kind {
+	case yaml.ScalarNode:
+		raw = []string{node.Value}
+	case yaml.SequenceNode:
+		if err := node.Decode(&raw); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("sni_whitelist must be a comma-separated string or a list of server names")
+	}
+	var names ServerNameList
+	for _, item := range raw {
+		for _, name := range strings.Split(item, ",") {
+			if name = strings.ToLower(strings.TrimSpace(name)); name != "" {
+				names = append(names, name)
+			}
+		}
+	}
+	*l = names
+	return nil
+}
+
+func (l ServerNameList) validate(kernelType string) error {
+	if len(l) == 0 {
+		return nil
+	}
+	if kernelType != "singbox" {
+		return fmt.Errorf("kernel.sni_whitelist requires kernel.type 'singbox'")
+	}
+	for _, name := range l {
+		if !isServerNamePattern(name) {
+			return fmt.Errorf("kernel.sni_whitelist: invalid server name %q", name)
+		}
+	}
+	return nil
+}
+
+// isServerNamePattern reports whether name is a DNS host name, optionally
+// prefixed with "*.", that can appear in SNI. IP literals never appear in SNI.
+func isServerNamePattern(name string) bool {
+	host := strings.TrimPrefix(strings.TrimSuffix(name, "."), "*.")
+	if host == "" || len(host) > 253 || net.ParseIP(host) != nil {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' && r != '_' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 type SharedRealityConfig struct {
@@ -745,6 +819,9 @@ func (c *Config) inheritFrom(parent *Config) {
 	if c.Kernel.UDPTimeout == "" {
 		c.Kernel.UDPTimeout = parent.Kernel.UDPTimeout
 	}
+	if len(c.Kernel.SNIWhitelist) == 0 {
+		c.Kernel.SNIWhitelist = parent.Kernel.SNIWhitelist
+	}
 	// Cert (NOT cert_dir — derived from config_dir later)
 	if c.Cert.CertMode == "" {
 		c.Cert.CertMode = parent.Cert.CertMode
@@ -1114,8 +1191,17 @@ func (c *Config) validate() error {
 			return err
 		}
 	}
+	if err := c.Kernel.SNIWhitelist.validate(c.Kernel.Type); err != nil {
+		return err
+	}
 	for i, entry := range entries {
-		if entry.Kernel == nil || entry.Kernel.SharedReality == nil {
+		if entry.Kernel == nil {
+			continue
+		}
+		if err := entry.Kernel.SNIWhitelist.validate(c.Kernel.Type); err != nil {
+			return fmt.Errorf("nodes[%d]: %w", i, err)
+		}
+		if entry.Kernel.SharedReality == nil {
 			continue
 		}
 		shared := entry.Kernel.SharedReality.clone()
@@ -1179,6 +1265,9 @@ func (c *Config) ExpandNodes() []*Config {
 			}
 			if entry.Kernel.CustomConfig != "" {
 				nodeCfg.Kernel.CustomConfig = entry.Kernel.CustomConfig
+			}
+			if len(entry.Kernel.SNIWhitelist) > 0 {
+				nodeCfg.Kernel.SNIWhitelist = entry.Kernel.SNIWhitelist
 			}
 		}
 		if entry.Kernel == nil || (c.hasNodeGroups() && entry.Kernel.ConfigDir == "") {

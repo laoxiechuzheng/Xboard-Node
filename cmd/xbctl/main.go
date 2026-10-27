@@ -106,6 +106,7 @@ type fileKernelConfig struct {
 	CustomRoute   []map[string]any            `yaml:"custom_route,omitempty"`
 	CustomOut     []map[string]any            `yaml:"custom_outbound,omitempty"`
 	SharedReality *config.SharedRealityConfig `yaml:"shared_reality,omitempty"`
+	SNIWhitelist  config.ServerNameList       `yaml:"sni_whitelist,omitempty"`
 }
 
 type fileLogConfig struct {
@@ -856,10 +857,11 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 	if p.Log.Level != "" || p.Log.Output != "" {
 		out.Log = &fileLogConfig{Level: p.Log.Level, Output: p.Log.Output}
 	}
-	if p.Kernel.Type != "" || p.Kernel.LogLevel != "" || p.Kernel.SharedReality != nil {
+	if p.Kernel.Type != "" || p.Kernel.LogLevel != "" || p.Kernel.SharedReality != nil || len(p.Kernel.SNIWhitelist) > 0 {
 		out.Kernel = &fileKernelConfig{
 			Type: p.Kernel.Type, LogLevel: p.Kernel.LogLevel,
 			SharedReality: p.Kernel.SharedReality,
+			SNIWhitelist:  p.Kernel.SNIWhitelist,
 		}
 	}
 	if p.Node.PushInterval != 0 || p.Node.PullInterval != 0 || p.Node.TrackInterval != 0 || p.Node.DeviceReportInterval != 0 {
@@ -902,6 +904,7 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 				CustomRoute:   inst.Kernel.CustomRoute,
 				CustomOut:     inst.Kernel.CustomOutbound,
 				SharedReality: inst.Kernel.SharedReality,
+				SNIWhitelist:  inst.Kernel.SNIWhitelist,
 			},
 			Log: fileLogConfig{
 				Level:  inst.Log.Level,

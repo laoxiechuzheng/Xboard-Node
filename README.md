@@ -104,6 +104,30 @@ servers with a firewall or private network. An untrusted peer can otherwise forg
 The forwarder must send its PROXY header before the original TLS handshake; no client-side setting is needed.
 Enabling this configuration requires restarting the target node process. No panel/database change is required.
 
+### Hysteria2 / TUIC SNI whitelist
+
+The sing-box Hysteria2 and TUIC (v5) inbounds can be restricted to a fixed set of TLS server names (SNI):
+
+```yaml
+kernel:
+  type: "singbox"
+  sni_whitelist: "iosapps.itunes.apple.com,apple.com,www.apple.com"   # or a YAML list
+```
+
+A QUIC handshake whose ClientHello has no SNI or an unlisted one is rejected by the server before any
+certificate is sent, so it fails even when the client enables `skip-cert-verify` / `allow_insecure`.
+Rejected handshakes never authenticate a user, so they are not routed, billed, device-tracked or audited.
+Names match case-insensitively and exactly; `*.example.com` matches any subdomain but not `example.com`.
+
+- Only Hysteria2 and TUIC inbounds are affected; Hysteria v1, VLESS, Trojan, AnyTLS and others are unchanged.
+- In multi-instance configs the top-level value is inherited; an instance or a node entry
+  (`nodes[].kernel.sni_whitelist`, or `node_overrides`) may set its own list, which replaces the inherited one.
+- Every SNI the panel hands to clients for these nodes (the node's TLS `server_name`, including alias
+  lines sharing the same port) must be listed, otherwise those clients can no longer connect.
+- `kernel.type: xray`, IP addresses and malformed names are rejected at config load. Empty = no restriction.
+- Requires the image built with this repository's sing-box fork (`server_name_allowlist` TLS option).
+  Changing the list restarts the node services like any other config change. No panel change is required.
+
 
 ### Connection audit (Flux)
 

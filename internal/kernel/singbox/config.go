@@ -469,9 +469,15 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert,
 	case "trojan":
 		return buildTrojan(base, nc, users, tc)
 	case "hysteria", "hysteria2":
-		return buildHysteria(base, nc, users, tc)
+		inbound := buildHysteria(base, nc, users, tc)
+		if protocol == "hysteria2" {
+			applySNIWhitelist(inbound, kcfgs)
+		}
+		return inbound
 	case "tuic":
-		return buildTUIC(base, nc, users, tc)
+		inbound := buildTUIC(base, nc, users, tc)
+		applySNIWhitelist(inbound, kcfgs)
+		return inbound
 	case "anytls":
 		if nc.GetProxyProtocol() || (len(kcfgs) > 0 && kcfgs[0].ForceProxyProtocol) {
 			// Match Xray: accept PROXY headers while preserving ordinary TLS connections.
@@ -489,6 +495,17 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert,
 		return buildMieru(base, nc, users)
 	default:
 		return nil
+	}
+}
+
+// applySNIWhitelist makes the inbound reject TLS handshakes whose SNI is not in
+// kernel.sni_whitelist. Without TLS the QUIC inbound cannot start at all.
+func applySNIWhitelist(inbound M, kcfgs []config.KernelConfig) {
+	if len(kcfgs) == 0 || len(kcfgs[0].SNIWhitelist) == 0 {
+		return
+	}
+	if tls, ok := inbound["tls"].(M); ok {
+		tls["server_name_allowlist"] = copyStrings(kcfgs[0].SNIWhitelist)
 	}
 }
 
