@@ -7,6 +7,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 	_ "unsafe"
 
 	xrayDispatcher "github.com/xtls/xray-core/app/dispatcher"
@@ -17,10 +18,14 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/features/routing"
+	hysteriaaccount "github.com/xtls/xray-core/proxy/hysteria/account"
+	"github.com/xtls/xray-core/proxy/shadowsocks"
+	ss2022 "github.com/xtls/xray-core/proxy/shadowsocks_2022"
 	"github.com/xtls/xray-core/proxy/trojan"
 	"github.com/xtls/xray-core/proxy/vless"
 	"github.com/xtls/xray-core/proxy/vmess"
 	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/pipe"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
@@ -67,10 +72,10 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 // LimitDispatcher wraps xray's DefaultDispatcher to enforce per-user
 // admission checks before a request is dispatched into xray-core.
 //
-// It intentionally does NOT replace transport.Link.Reader. Xray's mux/XUDP
-// close path requires the original concrete *pipe.Reader to remain intact, so
-// the dispatcher is limited to gate-keeping and safe connection lifecycle
-// bookkeeping (it only wraps the Writer to observe close).
+// It is limited to gate-keeping and connection lifecycle bookkeeping: it
+// wraps a link's Writer to observe close and, for Dispatch links, the
+// downlink *pipe.Reader to observe its end (see downlinkReader, which keeps
+// the pipe interface mux/XUDP relies on).
 //
 // It is also where removed users are cut off: every dispatch of a user that
 // is not (or no longer) in the configured user set is refused — this covers
@@ -86,7 +91,8 @@ type LimitDispatcher struct {
 	limitedIPs   map[string]map[string]int         // email → sourceIP → refcount
 	deviceLimits map[string]int                    // email → max devices
 	emailToUID   map[string]int                    // email → panel user ID; nil until configured
-	credentials  map[string]string                 // email → normalised credential the user must present
+	credentials  map[string]string                 // email → credential the user must present (see credentialFor)
+	credentialOf func(uuid string) string          // panel UUID → credential, for CloseUUID; nil means normalizeCredential
 	links        map[string]map[*liveLink]struct{} // email → live dispatched links
 	audit        *auditLogger
 
@@ -133,7 +139,7 @@ func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*
 	if id.email != "" {
 		// The outbound side runs on its own goroutine behind pipes, so
 		// interrupting this link's pipes is enough to tear it down.
-		if !d.trackLink(link, id, nil) {
+		if !d.trackLink(ctx, link, id, nil) {
 			return nil, errUserRevoked(id.email)
 		}
 		if audit := d.auditLog(); audit != nil {
@@ -156,7 +162,7 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 		// revocation; the context ends with the connection's parent context.
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithCancel(ctx)
-		if !d.trackLink(link, id, cancel) {
+		if !d.trackLink(ctx, link, id, cancel) {
 			return errUserRevoked(id.email)
 		}
 	}
@@ -174,7 +180,7 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 // linkIdentity is the authenticated user of one dispatch.
 type linkIdentity struct {
 	email    string
-	cred     string // normalised credential the session authenticated with, "" if unknown
+	cred     string // credential the session authenticated with (see accountCredential), "" if unknown
 	sourceIP string
 	isTCP    bool
 }
@@ -235,10 +241,12 @@ func (d *LimitDispatcher) admitsLocked(email, cred string) bool {
 	return true
 }
 
-// accountCredential returns the normalised secret a session authenticated
-// with, for the account types whose secret is the panel UUID as configured
-// (see buildVLESS/buildVMess/buildTrojan). Other types return "" and are
-// checked by email only.
+// accountCredential returns the secret a session authenticated with, in the
+// form credentialFor pins for the node's protocol: VLESS/VMess identify users
+// by the UUID's bytes (normalised); Trojan, Shadowsocks and Hysteria by the
+// exact configured string (for Shadowsocks 2022 the derived key, see
+// ss2022UserKey). Other types (socks, http) return "" and are checked by
+// email, plus the re-key sweep in UpdateLimits.
 func accountCredential(account protocol.Account) string {
 	switch a := account.(type) {
 	case *vless.MemoryAccount:
@@ -250,13 +258,19 @@ func accountCredential(account protocol.Account) string {
 			return normalizeCredential(a.ID.String())
 		}
 	case *trojan.MemoryAccount:
-		return normalizeCredential(a.Password)
+		return a.Password
+	case *shadowsocks.MemoryAccount:
+		return a.Password
+	case *ss2022.MemoryAccount:
+		return a.Key
+	case *hysteriaaccount.MemoryAccount:
+		return a.Auth
 	}
 	return ""
 }
 
-// normalizeCredential maps a panel UUID to the form xray reports it in, so
-// both sides of the comparison in admitsLocked agree.
+// normalizeCredential maps a panel UUID to the form xray reports a VLESS or
+// VMess ID in, so both sides of the comparison in admitsLocked agree.
 func normalizeCredential(secret string) string {
 	if id, err := uuid.ParseString(secret); err == nil {
 		return id.String()
@@ -270,16 +284,66 @@ type liveLink struct {
 	writer *closeTrackingWriter
 	cred   string
 	cancel context.CancelFunc // DispatchLink only
+
+	// open counts the ends (writer, and the downlink reader of a Dispatch
+	// pipe link) that must finish before the link is released.
+	open      atomic.Int32
+	onRelease func()
+
+	mu        sync.Mutex
+	released  bool
+	stopWatch func() bool // stops the context backstop registered by watch
 }
 
-// kill tears the link down. It must be called without mu held: the writer's
-// close callback takes it.
+// endOne records that one end of the link finished; the last one releases it.
+func (l *liveLink) endOne() {
+	if l.open.Add(-1) == 0 {
+		l.release()
+	}
+}
+
+// release runs onRelease exactly once, whichever comes first: the link's
+// ends finishing, its context ending, or kill.
+func (l *liveLink) release() {
+	l.mu.Lock()
+	if l.released {
+		l.mu.Unlock()
+		return
+	}
+	l.released = true
+	stop := l.stopWatch
+	l.stopWatch = nil
+	l.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	l.onRelease()
+}
+
+// watch releases the link when ctx ends. It is registered only after the
+// link is indexed, so a context that is already done cannot release it
+// before it is registered; the stop function is dropped once released.
+func (l *liveLink) watch(ctx context.Context) {
+	stop := context.AfterFunc(ctx, l.release)
+	l.mu.Lock()
+	if l.released {
+		l.mu.Unlock()
+		stop()
+		return
+	}
+	l.stopWatch = stop
+	l.mu.Unlock()
+}
+
+// kill tears the link down and releases it. It must be called without mu
+// held: the release callback takes it.
 func (l *liveLink) kill() {
 	if l.cancel != nil {
 		l.cancel()
 	}
 	l.writer.Interrupt()
 	common.Interrupt(l.reader)
+	l.release()
 }
 
 func killLinks(links []*liveLink) {
@@ -288,39 +352,46 @@ func killLinks(links []*liveLink) {
 	}
 }
 
-// trackLink records connection lifecycle without replacing xray-core owned
-// readers. This keeps mux/XUDP compatible while still allowing the dispatcher
-// to release device-limit state when the link closes, and to interrupt the
-// link when its user is removed. It re-checks admission under the same lock
-// UpdateLimits sweeps with, so a dispatch racing a removal cannot survive it;
-// a link that is no longer admitted is torn down and false is returned.
+// trackLink records connection lifecycle so the dispatcher can release
+// device-limit state when the link ends, and interrupt the link when its user
+// is removed. It re-checks admission under the same lock UpdateLimits sweeps
+// with, so a dispatch racing a removal cannot survive it; a link that is no
+// longer admitted is torn down and false is returned.
 //
-// Known limitation: the link leaves the index when its Writer (the uplink)
-// closes, because the Reader cannot be wrapped or observed without breaking
-// mux/XUDP, and the context of a mux sub-stream outlives it. A Dispatch link
-// whose client half-closed its upload therefore keeps its download running
-// through a removal, CloseUUID or a Stop drain until the outbound side ends
-// it (TestLimitDispatcherHalfClosedPipeLinkLeavesIndex pins this).
-// DispatchLink is not affected the same way: there the wrapped Writer carries
-// the downlink to the client, which the outbound closes when the response
-// ends.
-func (d *LimitDispatcher) trackLink(link *transport.Link, id linkIdentity, cancel context.CancelFunc) bool {
+// A link stays indexed (and counted) until the first of:
+//   - DispatchLink (cancel != nil): its Writer, the downlink to the client,
+//     closes or is interrupted;
+//   - Dispatch with a *pipe.Reader downlink: both the Writer (the uplink)
+//     closed and the downlink ended, so a client that half-closed its upload
+//     is still cut by a removal while its download runs;
+//   - Dispatch with any other reader: its Writer closes;
+//   - ctx ends: the inbound returned (the proxyman worker cancels the
+//     per-connection context after Process), which also covers inbounds that
+//     never close the Writer (SS2022's singbridge). XUDP links are dispatched
+//     under a timeout-only context their outbound outlives, so they rely on
+//     their ends only.
+func (d *LimitDispatcher) trackLink(ctx context.Context, link *transport.Link, id linkIdentity, cancel context.CancelFunc) bool {
 	d.connCount.Add(1)
 
-	live := &liveLink{reader: link.Reader, cred: id.cred, cancel: cancel}
-	onClose := func() {
+	live := &liveLink{cred: id.cred, cancel: cancel}
+	live.onRelease = func() {
 		d.unregisterLink(id.email, live)
 		if id.isTCP {
 			d.delConn(id.email, id.sourceIP)
 		}
 		d.connCount.Add(-1)
 	}
-
+	live.open.Store(1)
 	live.writer = &closeTrackingWriter{
 		Writer:  link.Writer,
-		onClose: onClose,
+		onClose: live.endOne,
 	}
 	link.Writer = live.writer
+	if downlink, ok := link.Reader.(*pipe.Reader); ok && cancel == nil {
+		live.open.Store(2)
+		link.Reader = &downlinkReader{Reader: downlink, onDone: live.endOne}
+	}
+	live.reader = link.Reader
 
 	d.mu.Lock()
 	admitted := d.admitsLocked(id.email, id.cred)
@@ -338,8 +409,12 @@ func (d *LimitDispatcher) trackLink(link *transport.Link, id linkIdentity, cance
 	d.mu.Unlock()
 	if !admitted {
 		live.kill()
+		return false
 	}
-	return admitted
+	if !session.TimeoutOnlyFromContext(ctx) {
+		live.watch(ctx)
+	}
+	return true
 }
 
 func (d *LimitDispatcher) unregisterLink(email string, live *liveLink) {
@@ -354,12 +429,13 @@ func (d *LimitDispatcher) unregisterLink(email string, live *liveLink) {
 }
 
 // collectRevokedLocked removes and returns the live links whose user is no
-// longer admitted. Must be called with mu held for writing.
-func (d *LimitDispatcher) collectRevokedLocked() []*liveLink {
+// longer admitted, and the credential-less links of rekeyed emails (see
+// UpdateLimits). Must be called with mu held for writing.
+func (d *LimitDispatcher) collectRevokedLocked(rekeyed map[string]bool) []*liveLink {
 	var revoked []*liveLink
 	for email, set := range d.links {
 		for live := range set {
-			if !d.admitsLocked(email, live.cred) {
+			if !d.admitsLocked(email, live.cred) || (live.cred == "" && rekeyed[email]) {
 				revoked = append(revoked, live)
 				delete(set, live)
 			}
@@ -375,8 +451,11 @@ func (d *LimitDispatcher) collectRevokedLocked() []*liveLink {
 // UUID id, and returns how many it interrupted. It does not stop the user
 // from connecting again; UpdateLimits without the user does that.
 func (d *LimitDispatcher) CloseUUID(id string) int {
-	cred := normalizeCredential(id)
 	d.mu.Lock()
+	cred := normalizeCredential(id)
+	if d.credentialOf != nil {
+		cred = d.credentialOf(id)
+	}
 	email := ""
 	if uid := d.emailToUID[id]; uid > 0 {
 		email = userEmail(uid)
@@ -421,22 +500,52 @@ func (d *LimitDispatcher) Close() error {
 // ─── Limit management (called by Xray kernel) ──────────────────────────────
 
 // UpdateLimits installs the current user set: emailToUID admits users,
-// deviceLimits caps their devices and credentials (email → normalised UUID)
-// pins the credential each email must present. Live links of users that are
-// no longer admitted — removed, or authenticated with a replaced UUID — are
-// interrupted, and their new dispatches are refused from now on.
+// deviceLimits caps their devices and credentials (email → credential, see
+// credentialFor) pins the credential each email must present. Live links of
+// users that are no longer admitted — removed, or authenticated with a
+// replaced UUID — are interrupted, and their new dispatches are refused from
+// now on.
+//
+// Links whose account type exposes no credential cannot be told apart by
+// it, so when an email's pinned credential changes they are cut as well: the
+// kernel installs the new set after removing the old account and before
+// adding the new one, so they belong to the old account.
 func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits map[string]int, credentials map[string]string) {
 	d.mu.Lock()
+	var rekeyed map[string]bool
+	for email, old := range d.credentials {
+		if old != "" && credentials[email] != old {
+			if rekeyed == nil {
+				rekeyed = make(map[string]bool)
+			}
+			rekeyed[email] = true
+		}
+	}
 	d.emailToUID = emailToUID
 	d.deviceLimits = deviceLimits
 	d.credentials = credentials
-	revoked := d.collectRevokedLocked()
+	revoked := d.collectRevokedLocked(rekeyed)
 	d.mu.Unlock()
 
 	if len(revoked) > 0 {
 		nlog.Core().Info("xray: interrupting connections of removed users", "connections", len(revoked))
 		killLinks(revoked)
 	}
+}
+
+// setCredentialFunc sets how CloseUUID maps a panel UUID to the credential
+// its sessions present; the kernel sets it with the node's protocol.
+func (d *LimitDispatcher) setCredentialFunc(credentialOf func(uuid string) string) {
+	d.mu.Lock()
+	d.credentialOf = credentialOf
+	d.mu.Unlock()
+}
+
+// credentialFunc returns the function set by setCredentialFunc, or nil.
+func (d *LimitDispatcher) credentialFunc() func(uuid string) string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.credentialOf
 }
 
 func (d *LimitDispatcher) SetAuditLogger(a *auditLogger) {
@@ -675,4 +784,69 @@ func (w *closeTrackingWriter) Interrupt() {
 		w.onClose()
 	}
 	common.Interrupt(w.Writer)
+}
+
+// downlinkReader observes the end of a Dispatch link's downlink: the inbound
+// reads the response from it until the outbound closes it, and interrupts it
+// when the connection fails. It keeps the pipe's ReturnAnError/Recover, which
+// mux uses to detach an XUDP session from its link (common/mux/session.go)
+// without ending it: an error injected that way is passed through as is and
+// does not count as the end.
+type downlinkReader struct {
+	*pipe.Reader
+	onDone func()
+	done   atomic.Bool
+}
+
+// injectedReadError marks an error injected through ReturnAnError while it
+// travels through the pipe.
+type injectedReadError struct{ err error }
+
+func (e *injectedReadError) Error() string {
+	if e.err == nil {
+		return "injected read error"
+	}
+	return e.err.Error()
+}
+
+func (r *downlinkReader) finish() {
+	if r.done.CompareAndSwap(false, true) {
+		r.onDone()
+	}
+}
+
+func (r *downlinkReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	mb, err := r.Reader.ReadMultiBuffer()
+	if err != nil {
+		if injected, ok := err.(*injectedReadError); ok {
+			return mb, injected.err
+		}
+		r.finish()
+	}
+	return mb, err
+}
+
+func (r *downlinkReader) ReadMultiBufferTimeout(timeout time.Duration) (buf.MultiBuffer, error) {
+	mb, err := r.Reader.ReadMultiBufferTimeout(timeout)
+	if err != nil && err != buf.ErrReadTimeout {
+		r.finish()
+	}
+	return mb, err
+}
+
+func (r *downlinkReader) Interrupt() {
+	r.Reader.Interrupt()
+	r.finish()
+}
+
+func (r *downlinkReader) ReturnAnError(err error) {
+	r.Reader.ReturnAnError(&injectedReadError{err: err})
+}
+
+func (r *downlinkReader) Recover() error {
+	err := r.Reader.Recover()
+	if injected, ok := err.(*injectedReadError); ok {
+		return injected.err
+	}
+	return err
 }

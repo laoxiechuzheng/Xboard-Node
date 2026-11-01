@@ -1,6 +1,7 @@
 package xray
 
 import (
+	"context"
 	"sync/atomic"
 	"testing"
 
@@ -191,7 +192,7 @@ func TestLimitDispatcher_TrackLinkPreservesReader(t *testing.T) {
 	origWriter := &closeTrackingWriter{Writer: buf.Discard, onClose: func() {}}
 	link := &transport.Link{Reader: origReader, Writer: origWriter}
 
-	ld.trackLink(link, linkIdentity{email: email, sourceIP: "1.1.1.1", isTCP: true}, nil)
+	ld.trackLink(context.Background(), link, linkIdentity{email: email, sourceIP: "1.1.1.1", isTCP: true}, nil)
 
 	if link.Reader != origReader {
 		t.Fatal("trackLink must not replace link.Reader")
@@ -210,7 +211,7 @@ func TestLimitDispatcher_CloseTrackingWriterReleasesConn(t *testing.T) {
 	}
 
 	link := &transport.Link{Reader: nopReader{}, Writer: buf.Discard}
-	ld.trackLink(link, linkIdentity{email: email, sourceIP: "1.1.1.1", isTCP: true}, nil)
+	ld.trackLink(context.Background(), link, linkIdentity{email: email, sourceIP: "1.1.1.1", isTCP: true}, nil)
 
 	if got := ld.connCount.Load(); got != 1 {
 		t.Fatalf("expected connCount=1 after tracking, got %d", got)

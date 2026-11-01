@@ -1,17 +1,19 @@
 package xray
 
 import (
+	"bufio"
 	"context"
+	"fmt"
 	"io"
 	stdnet "net"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
-	"github.com/xtls/xray-core/common/buf"
-	"github.com/xtls/xray-core/transport/pipe"
 )
 
 func startTCPEcho(t *testing.T) *stdnet.TCPAddr {
@@ -193,28 +195,82 @@ func TestXrayAddUsersWithNewUUIDReplacesAccount(t *testing.T) {
 	}
 }
 
-// Documents a known limitation (see trackLink): a Dispatch link leaves the
-// index when its uplink Writer closes, so a half-closed client's download is
-// not interrupted by a later removal. If this fails because the download is
-// now interrupted, the limitation was fixed: update trackLink's doc.
-func TestLimitDispatcherHalfClosedPipeLinkLeavesIndex(t *testing.T) {
-	ld, _ := newRemovalTestDispatcher()
-	installUsers(ld, model.UserSpec{ID: 1, UUID: removalUUID1})
-	link, err := ld.Dispatch(vlessUserContext(t, 1, removalUUID1), removalDest)
+// Clearing the user set through UpdateUsers is removing the last user: the
+// live links are cut and new dispatches refused before the kernel stops, so
+// Stop does not wait them out.
+func TestXrayUpdateUsersEmptyCutsLinksAndStops(t *testing.T) {
+	target := startTCPEcho(t)
+	port := freeTCPPort(t)
+	x := newRemovalTestXray(t)
+	only := model.UserSpec{ID: 1, UUID: removalUUID1}
+	if err := x.Start(vlessNode(port), []model.UserSpec{only}, kernel.TLSCert{}); err != nil {
+		t.Fatalf("start xray: %v", err)
+	}
+	conn := vlessDial(t, port, only.UUID, target)
+	if err := conn.echo("hello"); err != nil {
+		t.Fatalf("before clearing: %v", err)
+	}
+	ld := x.limitDispatcher
+
+	started := time.Now()
+	if added, removed, err := x.UpdateUsers([]model.UserSpec{}); err != nil || added != 0 || removed != 1 {
+		t.Fatalf("UpdateUsers(empty) = (%d, %d, %v), want (0, 1, nil)", added, removed, err)
+	}
+	if elapsed := time.Since(started); elapsed >= drainTimeout {
+		t.Fatalf("UpdateUsers(empty) took %v: Stop waited for the cleared user's link", elapsed)
+	}
+	if x.IsRunning() {
+		t.Fatal("kernel still running with no users")
+	}
+	conn.waitCut(t, "cleared user")
+	if _, err := ld.Dispatch(vlessUserContext(t, only.ID, only.UUID), removalDest); err == nil {
+		t.Fatal("stopped instance's dispatcher accepted the cleared user")
+	}
+	waitFor(t, "stopped instance to leave the draining set", func() bool { return !isDraining(x, ld) })
+}
+
+// httpConnect sends an HTTP CONNECT without credentials and returns the
+// status line, or an error when the proxy is not reachable.
+func httpConnect(port int, target *stdnet.TCPAddr) (string, error) {
+	conn, err := stdnet.DialTimeout("tcp", stdnet.JoinHostPort("127.0.0.1", strconv.Itoa(port)), time.Second)
 	if err != nil {
-		t.Fatal(err)
+		return "", err
 	}
-	// The client half-closes its upload; the downlink keeps running.
-	if err := link.Writer.(interface{ Close() error }).Close(); err != nil {
-		t.Fatal(err)
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target); err != nil {
+		return "", err
 	}
-	if got := ld.connCount.Load(); got != 0 {
-		t.Fatalf("connCount after the uplink closed = %d, want 0", got)
+	return bufio.NewReader(conn).ReadString('\n')
+}
+
+// xray's http inbound reads an empty account list as "no authentication":
+// clearing its users must not leave an instance listening with zero
+// accounts (a restart with no users used to do just that).
+func TestXrayUpdateUsersEmptyLeavesNoOpenHTTPProxy(t *testing.T) {
+	target := startTCPEcho(t)
+	port := freeTCPPort(t)
+	x := newRemovalTestXray(t)
+	node := &model.NodeSpec{Protocol: "http", ListenIP: "127.0.0.1", ServerPort: port}
+	if err := x.Start(node, []model.UserSpec{{ID: 1, UUID: removalUUID1}}, kernel.TLSCert{}); err != nil {
+		t.Fatalf("start xray: %v", err)
+	}
+	if status, err := httpConnect(port, target); err != nil || strings.Contains(status, " 200 ") {
+		t.Fatalf("anonymous CONNECT with a user configured = %q, %v; want a refusal", status, err)
 	}
 
-	installUsers(ld)
-	downlink := link.Reader.(*pipe.Reader)
-	if _, err := downlink.ReadMultiBufferTimeout(10 * time.Millisecond); err != buf.ErrReadTimeout {
-		t.Fatalf("half-closed link's downlink = %v; if it is now interrupted, update trackLink's doc and this test", err)
+	if added, removed, err := x.UpdateUsers(nil); err != nil || added != 0 || removed != 1 {
+		t.Fatalf("UpdateUsers(empty) = (%d, %d, %v), want (0, 1, nil)", added, removed, err)
 	}
+	if x.IsRunning() {
+		t.Fatal("http kernel still running with no users")
+	}
+	waitFor(t, "the http listener to close", func() bool {
+		conn, err := stdnet.DialTimeout("tcp", stdnet.JoinHostPort("127.0.0.1", strconv.Itoa(port)), time.Second)
+		if err != nil {
+			return true
+		}
+		conn.Close()
+		return false
+	})
 }

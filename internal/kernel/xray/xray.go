@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -601,6 +600,17 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 	toAdd, toRemove := kernel.UserDiff(x.users, users)
 	added, removed = len(toAdd), len(toRemove)
 
+	if len(users) == 0 && !x.sharedRealityLedgerEnabled() {
+		x.mu.Unlock()
+		// As RemoveUsers does for the last user: install the empty set
+		// first, then stop. Keeping an instance with no users would serve
+		// anyone on inbounds that read an empty account list as "no
+		// authentication" (http), and a restart would do just that.
+		x.updateDispatcherLimits(nil)
+		x.Stop()
+		return 0, removed, nil
+	}
+
 	if added == 0 && removed == 0 {
 		// Only limits changed — update dispatcher without restart.
 		x.users = users
@@ -746,9 +756,10 @@ func toMemoryUser(proto string, nc *model.NodeSpec, u model.UserSpec) (*protocol
 		}
 
 	case "shadowsocks":
-		if strings.HasPrefix(nc.Cipher, "2022-blake3-") {
-			// 2022-blake3 multi-user mode
-			mu.Account = &ss2022.MemoryAccount{Key: u.UUID}
+		if key, ok := ss2022UserKey(nc.Cipher, u.UUID); ok {
+			// 2022-blake3 multi-user mode: the same key buildShadowsocks
+			// configures, or the inbound cannot decode it.
+			mu.Account = &ss2022.MemoryAccount{Key: key}
 		} else {
 			// Traditional SS — build via getCipher path
 			ct := parseCipherType(nc.Cipher)
@@ -1027,26 +1038,49 @@ func (x *Xray) removeDraining(ld *LimitDispatcher) {
 // syncDrainingDispatchers installs the current user set on dispatchers of
 // instances that are still draining, so a user removed (or re-keyed) after
 // its instance was replaced loses those connections as well. Users that stay
-// keep them. current is skipped: the caller configures it with its audit
-// context.
+// keep them. Each pins credentials the way its own instance's protocol does
+// (set by configureDispatcher when it started). current is skipped: the
+// caller configures it with its audit context.
 func syncDrainingDispatchers(dispatchers []*LimitDispatcher, current *LimitDispatcher, users []model.UserSpec, enforceDeviceLimit bool) {
-	var emailToUID, deviceLimits map[string]int
-	var credentials map[string]string
 	for _, ld := range dispatchers {
 		if ld == nil || ld == current {
 			continue
 		}
-		if emailToUID == nil {
-			emailToUID, deviceLimits, credentials = dispatcherUserSet(users, enforceDeviceLimit)
-		}
-		// The maps are only read after installation, so sharing is safe.
-		ld.UpdateLimits(emailToUID, deviceLimits, credentials)
+		ld.UpdateLimits(dispatcherUserSet(users, ld.credentialFunc(), enforceDeviceLimit))
 	}
 }
 
+// credentialFor returns how the node's inbound identifies a user by its panel
+// UUID, in the form accountCredential reports a session's account in:
+// VLESS/VMess compare the UUID's bytes, Shadowsocks 2022 the derived key and
+// every other protocol the exact configured string. A nil node keeps the
+// UUID-normalising form.
+func credentialFor(nc *model.NodeSpec) func(uuid string) string {
+	if nc == nil {
+		return normalizeCredential
+	}
+	switch nc.Protocol {
+	case "vless", "vmess":
+		return normalizeCredential
+	case "shadowsocks":
+		cipher := nc.Cipher
+		return func(uuid string) string {
+			if key, ok := ss2022UserKey(cipher, uuid); ok {
+				return key
+			}
+			return uuid
+		}
+	}
+	return func(uuid string) string { return uuid }
+}
+
 // dispatcherUserSet builds the LimitDispatcher maps for users. Both the
-// stats email and the UUID map to the user ID.
-func dispatcherUserSet(users []model.UserSpec, enforceDeviceLimit bool) (emailToUID, deviceLimits map[string]int, credentials map[string]string) {
+// stats email and the UUID map to the user ID; credentialOf (nil means
+// normalizeCredential) pins the credential each email must present.
+func dispatcherUserSet(users []model.UserSpec, credentialOf func(uuid string) string, enforceDeviceLimit bool) (emailToUID, deviceLimits map[string]int, credentials map[string]string) {
+	if credentialOf == nil {
+		credentialOf = normalizeCredential
+	}
 	emailToUID = make(map[string]int, len(users)*2)
 	deviceLimits = make(map[string]int)
 	credentials = make(map[string]string, len(users))
@@ -1054,7 +1088,7 @@ func dispatcherUserSet(users []model.UserSpec, enforceDeviceLimit bool) (emailTo
 		email := userEmail(u.ID)
 		emailToUID[email] = u.ID
 		emailToUID[u.UUID] = u.ID
-		credentials[email] = normalizeCredential(u.UUID)
+		credentials[email] = credentialOf(u.UUID)
 		if enforceDeviceLimit && u.DeviceLimit > 0 {
 			deviceLimits[email] = u.DeviceLimit
 			deviceLimits[u.UUID] = u.DeviceLimit
@@ -1067,8 +1101,9 @@ func (x *Xray) configureDispatcher(ld *LimitDispatcher, nc *model.NodeSpec, user
 	if ld == nil {
 		return
 	}
-	emailToUID, deviceLimits, credentials := dispatcherUserSet(users, x.cfg.DeviceLimitEnforce)
-	ld.UpdateLimits(emailToUID, deviceLimits, credentials)
+	credentialOf := credentialFor(nc)
+	ld.setCredentialFunc(credentialOf)
+	ld.UpdateLimits(dispatcherUserSet(users, credentialOf, x.cfg.DeviceLimitEnforce))
 	if x.audit != nil {
 		logger := ld.auditLog()
 		if logger == nil {

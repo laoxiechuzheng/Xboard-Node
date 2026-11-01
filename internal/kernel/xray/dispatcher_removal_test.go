@@ -22,7 +22,8 @@ import (
 // out pipe links like the real one, DispatchLink blocks for the life of the
 // connection (until its context ends) like the real synchronous path.
 type fakeInnerDispatcher struct {
-	dispatched atomic.Int32
+	dispatched   atomic.Int32
+	lastDownlink atomic.Pointer[pipe.Writer] // outbound end of the last Dispatch link's downlink
 }
 
 func (*fakeInnerDispatcher) Type() interface{} { return nil }
@@ -34,7 +35,7 @@ func (f *fakeInnerDispatcher) Dispatch(context.Context, net.Destination) (*trans
 	uplinkReader, uplinkWriter := pipe.New()
 	downlinkReader, downlinkWriter := pipe.New()
 	_ = uplinkReader
-	_ = downlinkWriter
+	f.lastDownlink.Store(downlinkWriter)
 	return &transport.Link{Reader: downlinkReader, Writer: uplinkWriter}, nil
 }
 
@@ -70,8 +71,14 @@ func vlessUserContext(t *testing.T, userID int, id string) context.Context {
 var removalDest = net.TCPDestination(net.ParseAddress("198.51.100.1"), 443)
 
 func installUsers(ld *LimitDispatcher, users ...model.UserSpec) {
-	emailToUID, deviceLimits, credentials := dispatcherUserSet(users, false)
-	ld.UpdateLimits(emailToUID, deviceLimits, credentials)
+	installNodeUsers(ld, nil, users...)
+}
+
+// installNodeUsers installs users the way configureDispatcher does for node.
+func installNodeUsers(ld *LimitDispatcher, node *model.NodeSpec, users ...model.UserSpec) {
+	credentialOf := credentialFor(node)
+	ld.setCredentialFunc(credentialOf)
+	ld.UpdateLimits(dispatcherUserSet(users, credentialOf, false))
 }
 
 // linkInterrupted reports whether the link's uplink pipe was torn down.
@@ -256,32 +263,6 @@ func TestXrayUserRemovalReachesDrainingGenerations(t *testing.T) {
 	}
 	if !linkInterrupted(other) || !linkInterrupted(retiredKept) {
 		t.Fatal("CloseUserConnections did not reach the draining generation")
-	}
-}
-
-func TestAccountCredentialMatchesConfiguredUUID(t *testing.T) {
-	upper := "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"
-	parsed, err := uuid.ParseString(upper)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := accountCredential(&vless.MemoryAccount{ID: protocol.NewID(parsed)}), normalizeCredential(upper); got != want {
-		t.Fatalf("vless credential %q != configured %q", got, want)
-	}
-	mu, err := toMemoryUser("trojan", &model.NodeSpec{}, model.UserSpec{ID: 1, UUID: upper})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := accountCredential(mu.Account), normalizeCredential(upper); got != want {
-		t.Fatalf("trojan credential %q != configured %q", got, want)
-	}
-	// Account types whose secret is derived from the UUID are not compared.
-	ss, err := toMemoryUser("shadowsocks", &model.NodeSpec{Cipher: "aes-128-gcm"}, model.UserSpec{ID: 1, UUID: upper})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := accountCredential(ss.Account); got != "" {
-		t.Fatalf("shadowsocks credential = %q, want unchecked", got)
 	}
 }
 

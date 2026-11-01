@@ -439,23 +439,33 @@ var ss2022Methods = map[string]ss2022Config{
 	"2022-blake3-chacha20-poly1305": {"2022-blake3-chacha20-poly1305", 32},
 }
 
+// ss2022UserKey returns the per-user key of a Shadowsocks 2022 multi-user
+// inbound: Base64 of the user's UUID string truncated or zero-padded to the
+// cipher's key size. ok is false when cipher is not a 2022 cipher. Both the
+// config (buildShadowsocks) and hitless additions (toMemoryUser) use it.
+func ss2022UserKey(cipher, uuid string) (key string, ok bool) {
+	method, ok := ss2022Methods[cipher]
+	if !ok {
+		return "", false
+	}
+	raw := make([]byte, method.size)
+	copy(raw, uuid)
+	return base64.StdEncoding.EncodeToString(raw), true
+}
+
 func buildShadowsocks(base M, nc *model.NodeSpec, users []model.UserSpec) M {
-	ss2022, isSS2022 := ss2022Methods[nc.Cipher]
+	_, isSS2022 := ss2022Methods[nc.Cipher]
 
 	clients := make([]M, 0, len(users))
 
 	if isSS2022 {
 		// SS2022: server key at top level, per-user key must be Base64 of fixed-length raw bytes.
 		// Only blake3-aes-* supports multi-user in Xray; chacha20 variant is single-user only.
-		rawBuf := make([]byte, ss2022.size)
 		for i := range users {
 			u := &users[i]
-			for j := range rawBuf {
-				rawBuf[j] = 0
-			}
-			copy(rawBuf, u.UUID)
+			key, _ := ss2022UserKey(nc.Cipher, u.UUID)
 			clients = append(clients, M{
-				"password": base64.StdEncoding.EncodeToString(rawBuf),
+				"password": key,
 				"email":    userEmail(u.ID),
 			})
 		}
