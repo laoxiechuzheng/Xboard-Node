@@ -33,7 +33,8 @@ const drainTimeout = 5 * time.Second
 //
 // User operations (AddUsers/RemoveUsers/UpdateUsers) use sing-box's native
 // UpdatableInbound interface, which hot-swaps user credentials without
-// restarting listeners — zero connection disruption.
+// restarting listeners — zero disruption for users that stay. Connections of
+// removed users are closed by the ConnTracker when it gets the new user map.
 type SingBox struct {
 	cfg config.KernelConfig
 
@@ -173,8 +174,14 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	// Idle janitor lives for the lifetime of this instance context.
 	go tracker.runIdleJanitor(ctx)
 
-	// Recycle old instance in background — drain then close.
+	// Recycle old instance in background — drain then close. The old box
+	// keeps serving live connections while it drains: give its tracker the
+	// new user set first, so users this restart removed (or re-keyed) are
+	// cut now and their new streams refused, while kept users drain.
 	if oldBox != nil {
+		if oldTracker != nil {
+			oldTracker.SetUserMap(buildUserMap(users))
+		}
 		go recycleOldBox(oldBox, oldCancel, oldCtx, oldTracker)
 	}
 
@@ -278,8 +285,8 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 
 	// Trackers remain registered on the Router (which survives ReloadUsers).
 	// Only update the user map — do NOT re-register or traffic is double-counted.
-	// Publish it before the inbounds change: a HY2 session of a just-added user
-	// is closed by the tracker when its user is not in the map yet.
+	// Publish it before the inbounds change: the tracker refuses users that are
+	// not in the map yet, and closes connections of users no longer in it.
 	if s.connTracker != nil {
 		s.connTracker.SetUserMap(buildUserMap(users))
 		s.connTracker.SetAuditSink(s.cfg.AuditSink, nodeConfig.NodeID, inboundProtocol(nodeConfig))
@@ -501,8 +508,9 @@ func (s *SingBox) AddUsers(users []model.UserSpec) (int, error) {
 	return len(toAdd), nil
 }
 
-// RemoveUsers hot-swaps users out of running inbounds. Zero connection disruption
-// for remaining users.
+// RemoveUsers hot-swaps users out of running inbounds. Live connections of the
+// removed users are closed (by the tracker's SetUserMap); remaining users are
+// not disrupted.
 func (s *SingBox) RemoveUsers(users []model.UserSpec) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -590,8 +598,10 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 
 	nopFactory := singLog.NewNOPFactory()
 
-	// Publish the user map before the inbounds change so a HY2 session of a
-	// just-added user is not closed by the tracker as unknown.
+	// Publish the user map before the inbounds change: the tracker refuses
+	// connections of users missing from it, so a just-added user must be in
+	// the map before an inbound can authenticate it. Removed users (and old
+	// UUIDs of reset users) have their live connections closed right here.
 	if s.connTracker != nil {
 		s.connTracker.SetUserMap(buildUserMap(users))
 		s.connTracker.SetAuditSink(s.cfg.AuditSink, s.nodeConfig.NodeID, inboundProtocol(s.nodeConfig))
@@ -699,7 +709,9 @@ func (s *SingBox) CloseConnection(_ context.Context, connID string) error {
 	return nil
 }
 
-// CloseUserConnections terminates all connections for a user UUID.
+// CloseUserConnections terminates all live connections that authenticated
+// with a user UUID. User removal already does this; this is for callers that
+// need to cut a user that stays registered.
 func (s *SingBox) CloseUserConnections(_ context.Context, uuid string) error {
 	ct := s.connTrackerSafe()
 	if ct == nil {

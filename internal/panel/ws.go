@@ -467,8 +467,11 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 			nlog.Core().Warn("ws: cannot decode users payload", "error", err)
 			return
 		}
-		if len(p.Users) == 0 {
-			nlog.Core().Warn("ws: users payload empty")
+		// A missing (or null) "users" key carries no snapshot. An explicit []
+		// is a real full snapshot (e.g. the node lost all its groups) and must
+		// reach the service as a non-nil empty slice so it clears the users.
+		if p.Users == nil {
+			nlog.Core().Warn("ws: users payload missing users")
 			return
 		}
 		event.Users = p.Users

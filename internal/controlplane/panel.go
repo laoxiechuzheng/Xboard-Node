@@ -36,6 +36,9 @@ func (p *PanelControlPlane) SupportsDiscovery() bool     { return true }
 func (p *PanelControlPlane) SupportsReporting() bool     { return true }
 func (p *PanelControlPlane) SupportsDeviceReports() bool { return true }
 
+func (p *PanelControlPlane) InvalidateUserCache()   { p.client.ResetUserETag() }
+func (p *PanelControlPlane) InvalidateConfigCache() { p.client.ResetConfigETag() }
+
 func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange) (Bootstrap, error) {
 	hs, err := p.client.Handshake()
 	if err != nil {
@@ -69,24 +72,50 @@ func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[st
 }
 
 func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
-	configSnapshot, err := p.client.GetConfig()
+	return pollPanel(ctx, p.client, p.kcfg, "poll")
+}
+
+// pollPanel fetches config and users as one snapshot. The client stores each
+// ETag as soon as its 200 arrives, but any later failure drops the whole
+// snapshot, so the ETags this poll stored are reset again: kept, they would
+// turn the next poll into a 304 for data the caller never received.
+//
+// A config that fails normalization does not fail the poll: the users are
+// still returned (user expiry, bans and removals must keep syncing while an
+// admin fixes the config) and the error is reported in Snapshot.ConfigErr.
+// Only the config ETag is reset, so the next poll re-checks the config
+// instead of getting a 304 for one that was never applied.
+func pollPanel(ctx context.Context, client *panel.Client, kcfg config.KernelConfig, label string) (Snapshot, error) {
+	configSnapshot, err := client.GetConfig()
 	if err != nil {
-		return Snapshot{}, fmt.Errorf("poll config: %w", err)
+		return Snapshot{}, fmt.Errorf("%s config: %w", label, err)
 	}
-	users, err := p.client.GetUsers()
+	fail := func(usersFetched bool, err error) (Snapshot, error) {
+		if configSnapshot != nil {
+			client.ResetConfigETag()
+		}
+		if usersFetched {
+			client.ResetUserETag()
+		}
+		return Snapshot{}, err
+	}
+	users, err := client.GetUsers()
 	if err != nil {
-		return Snapshot{}, fmt.Errorf("poll users: %w", err)
+		return fail(false, fmt.Errorf("%s users: %w", label, err))
 	}
 	select {
 	case <-ctx.Done():
-		return Snapshot{}, ctx.Err()
+		return fail(true, ctx.Err())
 	default:
 	}
-	nodeSpec, err := model.NodeSpecFromPanelValidated(configSnapshot, p.kcfg)
+	snapshot := Snapshot{Users: model.UserSpecsFromPanel(users)}
+	snapshot.Config, err = model.NodeSpecFromPanelValidated(configSnapshot, kcfg)
 	if err != nil {
-		return Snapshot{}, fmt.Errorf("poll config normalize: %w", err)
+		client.ResetConfigETag()
+		snapshot.Config = nil
+		snapshot.ConfigErr = fmt.Errorf("%s config normalize: %w", label, err)
 	}
-	return Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users)}, nil
+	return snapshot, nil
 }
 
 func (p *PanelControlPlane) Discover(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange) (PushClient, error) {

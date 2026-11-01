@@ -46,6 +46,10 @@ type Bootstrap struct {
 type Snapshot struct {
 	Config *model.NodeSpec
 	Users  []model.UserSpec
+	// ConfigErr is set when the source returned a config it could not
+	// normalize. Config is then nil, Users are still valid and must be
+	// applied, and the next Poll fetches the config in full again.
+	ConfigErr error
 }
 
 type ReportPayload struct {
@@ -72,6 +76,14 @@ type Source interface {
 	Metrics() APIMetrics
 	SupportsPolling() bool
 	SupportsDiscovery() bool
+	// InvalidateUserCache drops the cached users ETag so the next Poll returns
+	// the full user list. Called after a pushed user event changed local state.
+	// It must be safe to call concurrently with Poll.
+	InvalidateUserCache()
+	// InvalidateConfigCache drops the cached config ETag so the next Poll
+	// returns the full config. Called when a pulled config was not applied.
+	// It must be safe to call concurrently with Poll.
+	InvalidateConfigCache()
 }
 
 type Sink interface {

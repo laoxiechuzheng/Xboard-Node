@@ -29,18 +29,14 @@ func TestLimitDispatcher_DeviceLimitCheck(t *testing.T) {
 
 	emailToUID := make(map[string]int)
 	deviceLimits := make(map[string]int)
-	speedLimits := make(map[string]int)
 	for _, u := range users {
 		email := userEmail(u.ID)
 		emailToUID[email] = u.ID
 		if u.DeviceLimit > 0 {
 			deviceLimits[email] = u.DeviceLimit
 		}
-		if u.SpeedLimit > 0 {
-			speedLimits[email] = u.SpeedLimit
-		}
 	}
-	ld.UpdateLimits(emailToUID, deviceLimits, speedLimits)
+	ld.UpdateLimits(emailToUID, deviceLimits, nil)
 
 	email1 := userEmail(1)
 
@@ -195,7 +191,7 @@ func TestLimitDispatcher_TrackLinkPreservesReader(t *testing.T) {
 	origWriter := &closeTrackingWriter{Writer: buf.Discard, onClose: func() {}}
 	link := &transport.Link{Reader: origReader, Writer: origWriter}
 
-	ld.trackLink(link, email, "1.1.1.1", true)
+	ld.trackLink(link, linkIdentity{email: email, sourceIP: "1.1.1.1", isTCP: true}, nil)
 
 	if link.Reader != origReader {
 		t.Fatal("trackLink must not replace link.Reader")
@@ -214,7 +210,7 @@ func TestLimitDispatcher_CloseTrackingWriterReleasesConn(t *testing.T) {
 	}
 
 	link := &transport.Link{Reader: nopReader{}, Writer: buf.Discard}
-	ld.trackLink(link, email, "1.1.1.1", true)
+	ld.trackLink(link, linkIdentity{email: email, sourceIP: "1.1.1.1", isTCP: true}, nil)
 
 	if got := ld.connCount.Load(); got != 1 {
 		t.Fatalf("expected connCount=1 after tracking, got %d", got)

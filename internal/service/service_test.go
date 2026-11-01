@@ -29,6 +29,9 @@ type fakeKernel struct {
 	updateCalls int
 	addCalls    int
 	removeCalls int
+	reloadCalls int
+
+	reloadConfig *model.NodeSpec
 
 	onStartUsers  func([]model.UserSpec)
 	onUpdateUsers func([]model.UserSpec)
@@ -57,7 +60,9 @@ func (f *fakeKernel) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, t
 func (f *fakeKernel) Stop()           { f.running = false }
 func (f *fakeKernel) IsRunning() bool { return f.running }
 func (f *fakeKernel) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
-	_, _, _ = nodeConfig, users, tls
+	_, _ = users, tls
+	f.reloadCalls++
+	f.reloadConfig = nodeConfig
 	return nil
 }
 func (f *fakeKernel) AddUsers(users []model.UserSpec) (int, error) {
@@ -378,6 +383,8 @@ func (noopSource) Discover(ctx context.Context, metricsFn func() map[string]inte
 func (noopSource) Metrics() controlplane.APIMetrics { return controlplane.APIMetrics{} }
 func (noopSource) SupportsPolling() bool            { return false }
 func (noopSource) SupportsDiscovery() bool          { return false }
+func (noopSource) InvalidateUserCache()             {}
+func (noopSource) InvalidateConfigCache()           {}
 
 func TestSendDeviceReportForceReportsUnchangedSnapshot(t *testing.T) {
 	tr := tracker.New()

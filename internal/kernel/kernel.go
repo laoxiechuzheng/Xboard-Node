@@ -36,9 +36,9 @@ func (t TLSCert) HasCert() bool {
 // Kernel is the interface for proxy kernel backends (sing-box, xray, etc.).
 //
 // The interface is split into lifecycle, user management, and observability
-// groups. User operations (AddUsers/RemoveUsers) are designed to be atomic
-// and non-disruptive — they MUST NOT restart listeners or drop existing
-// connections. Only Start and Reload may (re)bind ports.
+// groups. User operations (AddUsers/RemoveUsers/UpdateUsers) are designed to
+// be atomic and non-disruptive — they MUST NOT restart listeners or drop
+// connections of users that remain. Only Start and Reload may (re)bind ports.
 //
 // Implementors: singbox.SingBox, xray.Xray
 type Kernel interface {
@@ -69,13 +69,17 @@ type Kernel interface {
 	// Existing connections are unaffected. Returns the count actually added
 	// (duplicates are silently skipped).
 	AddUsers(users []model.UserSpec) (added int, err error)
-	// RemoveUsers deregisters users from the running kernel.
-	// Active connections of removed users are terminated. Returns the count
-	// actually removed (unknown IDs are silently skipped).
+	// RemoveUsers deregisters users from the running kernel. Their live
+	// connections are closed, and new connections or streams presenting their
+	// credentials — including new streams of a session (AnyTLS, mux/XUDP,
+	// QUIC) that authenticated before the removal — are refused. Returns the
+	// count actually removed (unknown IDs are silently skipped).
 	RemoveUsers(users []model.UserSpec) (removed int, err error)
 	// UpdateUsers replaces the entire user set atomically.
 	// This is equivalent to computing the diff and calling Add/Remove, but
-	// may be more efficient for bulk changes. Returns (added, removed) counts.
+	// may be more efficient for bulk changes. Removed users — and the old UUID
+	// of a user whose UUID changed — lose their live connections as with
+	// RemoveUsers. Returns (added, removed) counts.
 	UpdateUsers(users []model.UserSpec) (added, removed int, err error)
 
 	// ─── Observability ──────────────────────────────────────────────────
@@ -88,7 +92,9 @@ type Kernel interface {
 	GetUserTraffic(ctx context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error)
 	// CloseConnection terminates a specific connection by ID.
 	CloseConnection(ctx context.Context, connID string) error
-	// CloseUserConnections terminates all connections for the given user UUID.
+	// CloseUserConnections terminates all live connections that authenticated
+	// with the given user UUID. It does not deregister the user, who may
+	// reconnect; removal already closes connections by itself.
 	CloseUserConnections(ctx context.Context, uuid string) error
 	// SetSpeedLimitFunc configures per-user bandwidth throttling.
 	// The function resolves a user UUID to a *rate.Limiter (nil = unlimited).
@@ -138,10 +144,10 @@ func UserDiff(oldUsers, newUsers []model.UserSpec) (toAdd, toRemove []model.User
 		}
 	}
 	for _, u := range oldUsers {
-    newUser, exists := newMap[u.ID]
-    if !exists || newUser.UUID != u.UUID {
-        toRemove = append(toRemove, u)
-    }
-}
+		newUser, exists := newMap[u.ID]
+		if !exists || newUser.UUID != u.UUID {
+			toRemove = append(toRemove, u)
+		}
+	}
 	return
 }

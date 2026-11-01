@@ -44,6 +44,8 @@ func (p *MachinePanelControlPlane) SupportsPolling() bool       { return true }
 func (p *MachinePanelControlPlane) SupportsDiscovery() bool     { return false }
 func (p *MachinePanelControlPlane) SupportsReporting() bool     { return true }
 func (p *MachinePanelControlPlane) SupportsDeviceReports() bool { return p.push != nil }
+func (p *MachinePanelControlPlane) InvalidateUserCache()        { p.client.ResetUserETag() }
+func (p *MachinePanelControlPlane) InvalidateConfigCache()      { p.client.ResetConfigETag() }
 
 func (p *MachinePanelControlPlane) Initial(
 	ctx context.Context,
@@ -96,24 +98,7 @@ func (p *MachinePanelControlPlane) Initial(
 }
 
 func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
-	configSnapshot, err := p.client.GetConfig()
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("machine poll config: %w", err)
-	}
-	users, err := p.client.GetUsers()
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("machine poll users: %w", err)
-	}
-	select {
-	case <-ctx.Done():
-		return Snapshot{}, ctx.Err()
-	default:
-	}
-	nodeSpec, err := model.NodeSpecFromPanelValidated(configSnapshot, p.kcfg)
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("machine poll normalize: %w", err)
-	}
-	return Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users)}, nil
+	return pollPanel(ctx, p.client, p.kcfg, "machine poll")
 }
 
 func (p *MachinePanelControlPlane) Discover(

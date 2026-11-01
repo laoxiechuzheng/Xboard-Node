@@ -36,6 +36,9 @@ type Client struct {
 	machineID  int
 	httpClient *http.Client
 
+	// etagMu guards the cached ETags: the service invalidates the users ETag
+	// from its event loop while a pull goroutine reads and updates it.
+	etagMu     sync.Mutex
 	configETag string
 	userETag   string
 
@@ -79,7 +82,34 @@ func (c *Client) ForNode(nodeID int) *Client {
 // returns a full response instead of 304. Used by machine mode after a
 // pre-fetch to probe the transport type.
 func (c *Client) ResetConfigETag() {
+	c.etagMu.Lock()
 	c.configETag = ""
+	c.etagMu.Unlock()
+}
+
+// ResetUserETag clears the cached users ETag so the next GetUsers call
+// returns the full list instead of 304. The service calls it after applying a
+// WS user event: the local user set then no longer matches the snapshot the
+// ETag describes, and the panel set may return to that snapshot (ABA).
+func (c *Client) ResetUserETag() {
+	c.etagMu.Lock()
+	c.userETag = ""
+	c.etagMu.Unlock()
+}
+
+func (c *Client) cachedETag(etag *string) string {
+	c.etagMu.Lock()
+	defer c.etagMu.Unlock()
+	return *etag
+}
+
+func (c *Client) storeETag(etag *string, value string) {
+	if value == "" {
+		return
+	}
+	c.etagMu.Lock()
+	*etag = value
+	c.etagMu.Unlock()
 }
 
 // Handshake calls the new v2 API to get WS config + initial data in one shot.
@@ -217,7 +247,7 @@ func (c *Client) userPath() string {
 
 // GetConfig fetches node configuration. Returns nil if not modified (304).
 func (c *Client) GetConfig() (*NodeConfig, error) {
-	resp, err := c.doRequest("GET", c.configPath(), nil, c.configETag)
+	resp, err := c.doRequest("GET", c.configPath(), nil, c.cachedETag(&c.configETag))
 	if err != nil {
 		return nil, fmt.Errorf("get config: %w", err)
 	}
@@ -250,15 +280,13 @@ func (c *Client) GetConfig() (*NodeConfig, error) {
 		cfg.NodeID = c.nodeID
 	}
 
-	if etag := resp.Header.Get("ETag"); etag != "" {
-		c.configETag = etag
-	}
+	c.storeETag(&c.configETag, resp.Header.Get("ETag"))
 	return &cfg, nil
 }
 
 // GetUsers fetches available users. Returns nil if not modified (304).
 func (c *Client) GetUsers() ([]User, error) {
-	resp, err := c.doRequest("GET", c.userPath(), nil, c.userETag)
+	resp, err := c.doRequest("GET", c.userPath(), nil, c.cachedETag(&c.userETag))
 	if err != nil {
 		return nil, fmt.Errorf("get users: %w", err)
 	}
@@ -277,9 +305,7 @@ func (c *Client) GetUsers() ([]User, error) {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
 
-	if etag := resp.Header.Get("ETag"); etag != "" {
-		c.userETag = etag
-	}
+	c.storeETag(&c.userETag, resp.Header.Get("ETag"))
 	return usersResp.Users, nil
 }
 
@@ -320,8 +346,10 @@ func (c *Client) PushStatus(cpu float64, mem, swap, disk [2]uint64) error {
 
 // ResetETags clears cached ETags, forcing full responses
 func (c *Client) ResetETags() {
+	c.etagMu.Lock()
 	c.configETag = ""
 	c.userETag = ""
+	c.etagMu.Unlock()
 }
 
 // GetMachineNodes fetches the list of active nodes bound to this machine.

@@ -13,8 +13,13 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy/trojan"
+	"github.com/xtls/xray-core/proxy/vless"
+	"github.com/xtls/xray-core/proxy/vmess"
 	"github.com/xtls/xray-core/transport"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
@@ -52,6 +57,7 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 		inner:      orig,
 		innerDisp:  inner,
 		limitedIPs: make(map[string]map[string]int),
+		links:      make(map[string]map[*liveLink]struct{}),
 	}
 	globalLimitDispatcher.Store(ld)
 	nlog.Core().Debug("xray: limit dispatcher installed")
@@ -61,10 +67,15 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 // LimitDispatcher wraps xray's DefaultDispatcher to enforce per-user
 // admission checks before a request is dispatched into xray-core.
 //
-// It intentionally does NOT mutate transport.Link.Reader/Writer. Xray's
-// mux/XUDP close path requires the original concrete *pipe.Reader to remain
-// intact, so the dispatcher is limited to gate-keeping and safe connection
-// lifecycle bookkeeping.
+// It intentionally does NOT replace transport.Link.Reader. Xray's mux/XUDP
+// close path requires the original concrete *pipe.Reader to remain intact, so
+// the dispatcher is limited to gate-keeping and safe connection lifecycle
+// bookkeeping (it only wraps the Writer to observe close).
+//
+// It is also where removed users are cut off: every dispatch of a user that
+// is not (or no longer) in the configured user set is refused — this covers
+// new mux/XUDP sub-streams of a session that authenticated before the
+// removal — and UpdateLimits interrupts the live links of users it drops.
 type LimitDispatcher struct {
 	inner     interface{}        // original DefaultDispatcher (Feature + Dispatcher)
 	innerDisp routing.Dispatcher // same object, typed as Dispatcher
@@ -72,9 +83,11 @@ type LimitDispatcher struct {
 	// limitedUsers: users with device limit > 0, protected by mu.
 	// Needs deterministic IP ordering for kick decisions.
 	mu           sync.RWMutex
-	limitedIPs   map[string]map[string]int // email → sourceIP → refcount
-	deviceLimits map[string]int            // email → max devices
-	emailToUID   map[string]int            // email → panel user ID
+	limitedIPs   map[string]map[string]int         // email → sourceIP → refcount
+	deviceLimits map[string]int                    // email → max devices
+	emailToUID   map[string]int                    // email → panel user ID; nil until configured
+	credentials  map[string]string                 // email → normalised credential the user must present
+	links        map[string]map[*liveLink]struct{} // email → live dispatched links
 	audit        *auditLogger
 
 	// unlimitedIPs: users without device limit — sync.Map for lock-free access.
@@ -104,84 +117,287 @@ func (ic *ipCounter) aliveIPs() map[string]bool {
 // ─── routing.Dispatcher ──────────────────────────────────────────────────────
 
 func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*transport.Link, error) {
-	email, sourceIP, isTCP, err := d.identifyAndCheck(ctx, dest)
+	id, err := d.identifyAndCheck(ctx, dest)
 	if err != nil {
 		return nil, err
 	}
 
 	link, err := d.innerDisp.Dispatch(ctx, dest)
 	if err != nil {
-		if email != "" && isTCP {
-			d.delConn(email, sourceIP)
+		if id.email != "" && id.isTCP {
+			d.delConn(id.email, id.sourceIP)
 		}
 		return nil, err
 	}
 
-	if email != "" {
-		d.trackLink(link, email, sourceIP, isTCP)
+	if id.email != "" {
+		// The outbound side runs on its own goroutine behind pipes, so
+		// interrupting this link's pipes is enough to tear it down.
+		if !d.trackLink(link, id, nil) {
+			return nil, errUserRevoked(id.email)
+		}
 		if audit := d.auditLog(); audit != nil {
-			audit.LogAccepted(email, sourceIP, dest)
+			audit.LogAccepted(id.email, id.sourceIP, dest)
 		}
 	}
 	return link, nil
 }
 
 func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination, link *transport.Link) error {
-	email, sourceIP, isTCP, err := d.identifyAndCheck(ctx, dest)
+	id, err := d.identifyAndCheck(ctx, dest)
 	if err != nil {
 		return err
 	}
 
-	if email != "" {
-		d.trackLink(link, email, sourceIP, isTCP)
+	if id.email != "" {
+		// The link reads and writes the client connection directly (VLESS
+		// Vision, REALITY), where Interrupt is a no-op: revoking cancels the
+		// context the outbound runs under instead. cancel is only called on
+		// revocation; the context ends with the connection's parent context.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		if !d.trackLink(link, id, cancel) {
+			return errUserRevoked(id.email)
+		}
 	}
 	if err := d.innerDisp.DispatchLink(ctx, dest, link); err != nil {
 		return err
 	}
-	if email != "" {
+	if id.email != "" {
 		if audit := d.auditLog(); audit != nil {
-			audit.LogAccepted(email, sourceIP, dest)
+			audit.LogAccepted(id.email, id.sourceIP, dest)
 		}
 	}
 	return nil
 }
 
-// identifyAndCheck extracts user identity from the session context, enforces
-// device limits, and returns the user's email, source IP, and TCP flag.
-// Returns a non-nil error only when the connection should be rejected.
-func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destination) (email, sourceIP string, isTCP bool, err error) {
-	si := session.InboundFromContext(ctx)
-	if si == nil || si.User == nil || len(si.User.Email) == 0 {
-		return "", "", false, nil
-	}
-	email = si.User.Email
-	sourceIP = si.Source.Address.IP().String()
-	isTCP = dest.Network == net.Network_TCP
-
-	if d.checkDeviceLimit(email, sourceIP, isTCP) {
-		nlog.Core().Debug("xray: device limit exceeded", "email", email, "ip", sourceIP)
-		return "", "", false, errors.New("device limit exceeded for " + email)
-	}
-	return email, sourceIP, isTCP, nil
+// linkIdentity is the authenticated user of one dispatch.
+type linkIdentity struct {
+	email    string
+	cred     string // normalised credential the session authenticated with, "" if unknown
+	sourceIP string
+	isTCP    bool
 }
 
-// trackLink records connection lifecycle without mutating xray-core owned
-// transport primitives. This keeps mux/XUDP compatible while still allowing
-// the dispatcher to release device-limit state when the link closes.
-func (d *LimitDispatcher) trackLink(link *transport.Link, email, sourceIP string, isTCP bool) {
+func errUserRevoked(email string) error {
+	return errors.New("user " + email + " is not a current user of this node")
+}
+
+// identifyAndCheck extracts user identity from the session context, refuses
+// users that are not (or no longer) current, enforces device limits, and
+// returns the user's identity. Returns a non-nil error only when the
+// connection should be rejected.
+func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destination) (linkIdentity, error) {
+	si := session.InboundFromContext(ctx)
+	if si == nil || si.User == nil || len(si.User.Email) == 0 {
+		return linkIdentity{}, nil
+	}
+	id := linkIdentity{
+		email:    si.User.Email,
+		cred:     accountCredential(si.User.Account),
+		sourceIP: si.Source.Address.IP().String(),
+		isTCP:    dest.Network == net.Network_TCP,
+	}
+
+	// A mux/XUDP session authenticates once; its later sub-streams are only
+	// stopped here once the user was removed or its UUID replaced.
+	d.mu.RLock()
+	admitted := d.admitsLocked(id.email, id.cred)
+	d.mu.RUnlock()
+	if !admitted {
+		nlog.Core().Debug("xray: refusing dispatch of removed user", "email", id.email)
+		return linkIdentity{}, errUserRevoked(id.email)
+	}
+
+	if d.checkDeviceLimit(id.email, id.sourceIP, id.isTCP) {
+		nlog.Core().Debug("xray: device limit exceeded", "email", id.email, "ip", id.sourceIP)
+		return linkIdentity{}, errors.New("device limit exceeded for " + id.email)
+	}
+	return id, nil
+}
+
+// admitsLocked reports whether email, authenticated with cred, is a current
+// user. Until the kernel configures the user set (emailToUID == nil) every
+// user is admitted, so nothing is rejected during startup.
+// Must be called with mu held.
+func (d *LimitDispatcher) admitsLocked(email, cred string) bool {
+	if d.emailToUID == nil {
+		return true
+	}
+	if _, ok := d.emailToUID[email]; !ok {
+		return false
+	}
+	// The email is keyed by user ID and survives a UUID reset; the
+	// credential tells the old UUID's sessions apart from the new one.
+	if want := d.credentials[email]; want != "" && cred != "" && want != cred {
+		return false
+	}
+	return true
+}
+
+// accountCredential returns the normalised secret a session authenticated
+// with, for the account types whose secret is the panel UUID as configured
+// (see buildVLESS/buildVMess/buildTrojan). Other types return "" and are
+// checked by email only.
+func accountCredential(account protocol.Account) string {
+	switch a := account.(type) {
+	case *vless.MemoryAccount:
+		if a.ID != nil {
+			return normalizeCredential(a.ID.String())
+		}
+	case *vmess.MemoryAccount:
+		if a.ID != nil {
+			return normalizeCredential(a.ID.String())
+		}
+	case *trojan.MemoryAccount:
+		return normalizeCredential(a.Password)
+	}
+	return ""
+}
+
+// normalizeCredential maps a panel UUID to the form xray reports it in, so
+// both sides of the comparison in admitsLocked agree.
+func normalizeCredential(secret string) string {
+	if id, err := uuid.ParseString(secret); err == nil {
+		return id.String()
+	}
+	return secret
+}
+
+// liveLink is one dispatched link of an authenticated user.
+type liveLink struct {
+	reader buf.Reader
+	writer *closeTrackingWriter
+	cred   string
+	cancel context.CancelFunc // DispatchLink only
+}
+
+// kill tears the link down. It must be called without mu held: the writer's
+// close callback takes it.
+func (l *liveLink) kill() {
+	if l.cancel != nil {
+		l.cancel()
+	}
+	l.writer.Interrupt()
+	common.Interrupt(l.reader)
+}
+
+func killLinks(links []*liveLink) {
+	for _, l := range links {
+		l.kill()
+	}
+}
+
+// trackLink records connection lifecycle without replacing xray-core owned
+// readers. This keeps mux/XUDP compatible while still allowing the dispatcher
+// to release device-limit state when the link closes, and to interrupt the
+// link when its user is removed. It re-checks admission under the same lock
+// UpdateLimits sweeps with, so a dispatch racing a removal cannot survive it;
+// a link that is no longer admitted is torn down and false is returned.
+//
+// Known limitation: the link leaves the index when its Writer (the uplink)
+// closes, because the Reader cannot be wrapped or observed without breaking
+// mux/XUDP, and the context of a mux sub-stream outlives it. A Dispatch link
+// whose client half-closed its upload therefore keeps its download running
+// through a removal, CloseUUID or a Stop drain until the outbound side ends
+// it (TestLimitDispatcherHalfClosedPipeLinkLeavesIndex pins this).
+// DispatchLink is not affected the same way: there the wrapped Writer carries
+// the downlink to the client, which the outbound closes when the response
+// ends.
+func (d *LimitDispatcher) trackLink(link *transport.Link, id linkIdentity, cancel context.CancelFunc) bool {
 	d.connCount.Add(1)
 
+	live := &liveLink{reader: link.Reader, cred: id.cred, cancel: cancel}
 	onClose := func() {
-		if isTCP {
-			d.delConn(email, sourceIP)
+		d.unregisterLink(id.email, live)
+		if id.isTCP {
+			d.delConn(id.email, id.sourceIP)
 		}
 		d.connCount.Add(-1)
 	}
 
-	link.Writer = &closeTrackingWriter{
+	live.writer = &closeTrackingWriter{
 		Writer:  link.Writer,
 		onClose: onClose,
 	}
+	link.Writer = live.writer
+
+	d.mu.Lock()
+	admitted := d.admitsLocked(id.email, id.cred)
+	if admitted {
+		if d.links == nil {
+			d.links = make(map[string]map[*liveLink]struct{})
+		}
+		set := d.links[id.email]
+		if set == nil {
+			set = make(map[*liveLink]struct{})
+			d.links[id.email] = set
+		}
+		set[live] = struct{}{}
+	}
+	d.mu.Unlock()
+	if !admitted {
+		live.kill()
+	}
+	return admitted
+}
+
+func (d *LimitDispatcher) unregisterLink(email string, live *liveLink) {
+	d.mu.Lock()
+	if set := d.links[email]; set != nil {
+		delete(set, live)
+		if len(set) == 0 {
+			delete(d.links, email)
+		}
+	}
+	d.mu.Unlock()
+}
+
+// collectRevokedLocked removes and returns the live links whose user is no
+// longer admitted. Must be called with mu held for writing.
+func (d *LimitDispatcher) collectRevokedLocked() []*liveLink {
+	var revoked []*liveLink
+	for email, set := range d.links {
+		for live := range set {
+			if !d.admitsLocked(email, live.cred) {
+				revoked = append(revoked, live)
+				delete(set, live)
+			}
+		}
+		if len(set) == 0 {
+			delete(d.links, email)
+		}
+	}
+	return revoked
+}
+
+// CloseUUID interrupts every live link that authenticated with the panel
+// UUID id, and returns how many it interrupted. It does not stop the user
+// from connecting again; UpdateLimits without the user does that.
+func (d *LimitDispatcher) CloseUUID(id string) int {
+	cred := normalizeCredential(id)
+	d.mu.Lock()
+	email := ""
+	if uid := d.emailToUID[id]; uid > 0 {
+		email = userEmail(uid)
+	}
+	var victims []*liveLink
+	for linkEmail, set := range d.links {
+		for live := range set {
+			// Links of account types without a known credential are
+			// matched by the email of the user that owns the UUID now.
+			if (live.cred != "" && live.cred == cred) || (live.cred == "" && email != "" && linkEmail == email) {
+				victims = append(victims, live)
+				delete(set, live)
+			}
+		}
+		if len(set) == 0 {
+			delete(d.links, linkEmail)
+		}
+	}
+	d.mu.Unlock()
+	killLinks(victims)
+	return len(victims)
 }
 
 // ─── features.Feature (delegated) ───────────────────────────────────────────
@@ -204,12 +420,23 @@ func (d *LimitDispatcher) Close() error {
 
 // ─── Limit management (called by Xray kernel) ──────────────────────────────
 
-func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, _ map[string]int) {
+// UpdateLimits installs the current user set: emailToUID admits users,
+// deviceLimits caps their devices and credentials (email → normalised UUID)
+// pins the credential each email must present. Live links of users that are
+// no longer admitted — removed, or authenticated with a replaced UUID — are
+// interrupted, and their new dispatches are refused from now on.
+func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits map[string]int, credentials map[string]string) {
 	d.mu.Lock()
 	d.emailToUID = emailToUID
 	d.deviceLimits = deviceLimits
+	d.credentials = credentials
+	revoked := d.collectRevokedLocked()
 	d.mu.Unlock()
 
+	if len(revoked) > 0 {
+		nlog.Core().Info("xray: interrupting connections of removed users", "connections", len(revoked))
+		killLinks(revoked)
+	}
 }
 
 func (d *LimitDispatcher) SetAuditLogger(a *auditLogger) {
@@ -228,6 +455,7 @@ func (d *LimitDispatcher) auditLog() *auditLogger {
 func (d *LimitDispatcher) ResetConns() {
 	d.mu.Lock()
 	d.limitedIPs = make(map[string]map[string]int)
+	d.links = make(map[string]map[*liveLink]struct{})
 	d.mu.Unlock()
 
 	// Clear unlimited IPs

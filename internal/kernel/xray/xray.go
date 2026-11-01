@@ -75,6 +75,11 @@ type Xray struct {
 	sharedRetired    []*sharedRealityGeneration
 	sharedLedger     atomic.Bool
 
+	// drainingLDs holds the dispatchers of replaced or stopped non-ledger
+	// instances while closeOld drains them (up to minutes), so user removals
+	// and CloseUserConnections still reach their live links.
+	drainingLDs map[*LimitDispatcher]struct{}
+
 	// running is set after a successful Start and cleared before shutdown.
 	// Atomic so IsRunning / GetConnections never block.
 	running atomic.Bool
@@ -98,7 +103,7 @@ func (x *Xray) Capabilities() kernel.Capabilities {
 		BuiltInTrafficStats:  true,
 		AliveIPTracking:      true,
 		ForceCloseConnection: false,
-		ForceCloseUser:       false,
+		ForceCloseUser:       true,
 	}
 }
 
@@ -192,7 +197,10 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	if x.sharedRealityLedgerEnabled() && old != nil {
 		retired = &sharedRealityGeneration{instance: old, dispatcher: oldLD, runtime: x.sharedRuntime, users: x.sharedUserIDsLocked()}
 		x.sharedRetired = append(x.sharedRetired, retired)
+	} else if old != nil && oldLD != ld {
+		x.addDrainingLocked(oldLD)
 	}
+	draining := x.drainingDispatchersLocked()
 	x.instance = inst
 	x.limitDispatcher = ld
 	x.users = users
@@ -218,11 +226,16 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	}
 	x.mu.Unlock()
 
+	// Old instances keep serving their live connections while they drain
+	// (minutes). Users missing from the new set must not ride on them; later
+	// user changes reach them through drainingDispatchersLocked.
+	syncDrainingDispatchers(draining, ld, users, x.cfg.DeviceLimitEnforce)
+
 	// ── Phase 5: Recycle old (background, non-blocking) ─────────────────
 	if retired != nil {
 		go x.retireSharedReality(retired)
 	} else {
-		closeOld(old, oldLD)
+		x.closeOld(old, oldLD)
 	}
 
 	x.updateBandwidthLimits(users)
@@ -272,12 +285,15 @@ func (x *Xray) Stop() {
 	ld := x.limitDispatcher
 	x.instance = nil
 	x.limitDispatcher = nil
+	if inst != nil {
+		x.addDrainingLocked(ld)
+	}
 	x.mu.Unlock()
 
 	if ld != nil {
 		drainConns(ld, drainTimeout)
 	}
-	closeOld(inst, ld)
+	x.closeOld(inst, ld)
 }
 
 func (x *Xray) IsRunning() bool { return x.running.Load() }
@@ -339,8 +355,19 @@ func (x *Xray) CloseConnection(_ context.Context, _ string) error {
 	return nil
 }
 
-func (x *Xray) CloseUserConnections(_ context.Context, _ string) error {
-	// No-op: handled by RemoveUsers at the xray core level.
+// CloseUserConnections interrupts every live link that authenticated with the
+// user UUID, on the running instance and on instances still draining. User
+// removal already does this through the dispatcher's user set; this is for
+// callers that need to cut a user that stays registered.
+func (x *Xray) CloseUserConnections(_ context.Context, uuid string) error {
+	x.mu.Lock()
+	dispatchers := append(x.drainingDispatchersLocked(), x.limitDispatcher)
+	x.mu.Unlock()
+	for _, ld := range dispatchers {
+		if ld != nil {
+			ld.CloseUUID(uuid)
+		}
+	}
 	return nil
 }
 
@@ -386,13 +413,19 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	}
 
 	// Merge: overwrite existing users' properties, collect truly new ones.
+	// An existing ID with a new UUID is a replacement: its old account must
+	// leave the inbound and the new one join it, or the dispatcher (pinned to
+	// the new UUID) would lock the user out.
 	userMap := make(map[int]model.UserSpec, len(x.users))
 	for _, u := range x.users {
 		userMap[u.ID] = u
 	}
-	var toAdd []model.UserSpec
+	var toAdd, toReplace []model.UserSpec
 	for _, u := range users {
-		if _, exists := userMap[u.ID]; !exists {
+		if existing, exists := userMap[u.ID]; !exists {
+			toAdd = append(toAdd, u)
+		} else if existing.UUID != u.UUID {
+			toReplace = append(toReplace, existing)
 			toAdd = append(toAdd, u)
 		}
 		userMap[u.ID] = u // always overwrite properties
@@ -432,6 +465,16 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	x.mu.Unlock()
 
 	ctx := context.Background()
+	// Same order as UpdateUsers: remove replaced accounts, install the new
+	// set (cutting the old UUIDs' links and admitting the new users and
+	// UUIDs before the inbound can authenticate them), then add.
+	for _, u := range toReplace {
+		if err := um.RemoveUser(ctx, userEmail(u.ID)); err != nil {
+			nlog.Core().Debug("xray: RemoveUser skipped in AddUsers", "user", u.ID, "error", err)
+		}
+	}
+	x.updateDispatcherLimits(merged)
+
 	added := 0
 	for _, u := range toAdd {
 		mu, err := toMemoryUser(proto, nc, u)
@@ -455,7 +498,6 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 		}
 	}
 	x.mu.Unlock()
-	x.updateDispatcherLimits(merged)
 	x.updateBandwidthLimits(merged)
 
 	nlog.Core().Info("xray: users added via UserManager", "added", added, "total", len(merged))
@@ -464,6 +506,8 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 
 // RemoveUsers removes users from the running kernel via xray's UserManager API.
 // Truly hitless for supported protocols — remaining connections unaffected.
+// The removed users' live links are interrupted, and their new (mux/XUDP)
+// dispatches refused, when updateDispatcherLimits installs the kept set.
 func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 	if x.sharedRealityLedgerEnabled() {
 		x.lifecycleMu.Lock()
@@ -494,6 +538,10 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 
 	if len(kept) == 0 && !x.sharedRealityLedgerEnabled() {
 		x.mu.Unlock()
+		// Install the empty set first: it interrupts the removed users'
+		// live links and refuses their new dispatches, so the instance
+		// drains at once instead of serving them while Stop waits.
+		x.updateDispatcherLimits(nil)
 		x.Stop()
 		return removed, nil
 	}
@@ -537,7 +585,9 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 
 // UpdateUsers replaces the entire user set. If only speed/device limits
 // changed, updates the dispatcher without restarting. Otherwise uses
-// UserManager for hitless add/remove where supported.
+// UserManager for hitless add/remove where supported. Live links of removed
+// users, and of the old UUID of a user whose UUID changed, are interrupted
+// when updateDispatcherLimits installs the new set.
 func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err error) {
 	if x.sharedRealityLedgerEnabled() {
 		x.lifecycleMu.Lock()
@@ -590,6 +640,10 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 			nlog.Core().Debug("xray: RemoveUser skipped in UpdateUsers", "user", u.ID, "error", err)
 		}
 	}
+	// Install the new set between removal and addition: it cuts the live
+	// links of removed users and old UUIDs, and admits added users (and new
+	// UUIDs) before the inbound can authenticate them.
+	x.updateDispatcherLimits(users)
 	for _, u := range toAdd {
 		mu, err := toMemoryUser(proto, nc, u)
 		if err != nil {
@@ -609,7 +663,6 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 		}
 	}
 	x.mu.Unlock()
-	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
 
 	nlog.Core().Info("xray: users updated via UserManager", "added", added, "removed", removed, "total", len(users))
@@ -802,11 +855,14 @@ func startWithTimeout(inst *xrayCore.Instance, timeout time.Duration) error {
 // closeOld shuts down a previously running instance and its dispatcher.
 // Recycling happens in a background goroutine to prevent the main thread
 // from blocking on slow connection draining, enabling "hitless" reload.
-func closeOld(inst *xrayCore.Instance, ld *LimitDispatcher) {
+// The dispatcher leaves the draining set once the instance is closed.
+func (x *Xray) closeOld(inst *xrayCore.Instance, ld *LimitDispatcher) {
 	if inst == nil {
+		x.removeDraining(ld)
 		return
 	}
 	go func() {
+		defer x.removeDraining(ld)
 		// 1. Drain connections gracefully (best effort, e.g. 5 minutes)
 		// We use a much longer timeout here than the default Stop() because
 		// it's running in background and doesn't block new user connections.
@@ -910,14 +966,17 @@ func (x *Xray) updateBandwidthLimits(users []model.UserSpec) {
 	}
 }
 
-// updateDispatcherLimits configures the LimitDispatcher with per-user
-// device-limit admission metadata only. Speed limits are enforced by the
-// patched xray-core bandwidth feature.
+// updateDispatcherLimits configures the LimitDispatcher with the current user
+// set: admission (removed users are refused and their live links
+// interrupted) and device limits. Speed limits are enforced by the patched
+// xray-core bandwidth feature.
 func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 	x.mu.Lock()
 	ld := x.limitDispatcher
 	nc := x.nodeConfig
+	draining := x.drainingDispatchersLocked()
 	x.mu.Unlock()
+	syncDrainingDispatchers(draining, ld, users, x.cfg.DeviceLimitEnforce)
 	if ld == nil {
 		if x.audit != nil {
 			x.audit.UpdateContext(nc, users)
@@ -927,24 +986,89 @@ func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 	x.configureDispatcher(ld, nc, users)
 }
 
-func (x *Xray) configureDispatcher(ld *LimitDispatcher, nc *model.NodeSpec, users []model.UserSpec) {
+// drainingDispatchersLocked returns the dispatchers of instances that keep
+// serving their live connections until drained: retired shared REALITY
+// generations, and non-ledger instances replaced by Start or stopped.
+// Must be called with x.mu held.
+func (x *Xray) drainingDispatchersLocked() []*LimitDispatcher {
+	var dispatchers []*LimitDispatcher
+	for _, generation := range x.sharedRetired {
+		if generation.dispatcher != nil {
+			dispatchers = append(dispatchers, generation.dispatcher)
+		}
+	}
+	for ld := range x.drainingLDs {
+		dispatchers = append(dispatchers, ld)
+	}
+	return dispatchers
+}
+
+// addDrainingLocked records the dispatcher of an instance handed to closeOld.
+// Must be called with x.mu held.
+func (x *Xray) addDrainingLocked(ld *LimitDispatcher) {
 	if ld == nil {
 		return
 	}
-	emailToUID := make(map[string]int, len(users)*2)
-	deviceLimits := make(map[string]int)
+	if x.drainingLDs == nil {
+		x.drainingLDs = make(map[*LimitDispatcher]struct{})
+	}
+	x.drainingLDs[ld] = struct{}{}
+}
 
+func (x *Xray) removeDraining(ld *LimitDispatcher) {
+	if ld == nil {
+		return
+	}
+	x.mu.Lock()
+	delete(x.drainingLDs, ld)
+	x.mu.Unlock()
+}
+
+// syncDrainingDispatchers installs the current user set on dispatchers of
+// instances that are still draining, so a user removed (or re-keyed) after
+// its instance was replaced loses those connections as well. Users that stay
+// keep them. current is skipped: the caller configures it with its audit
+// context.
+func syncDrainingDispatchers(dispatchers []*LimitDispatcher, current *LimitDispatcher, users []model.UserSpec, enforceDeviceLimit bool) {
+	var emailToUID, deviceLimits map[string]int
+	var credentials map[string]string
+	for _, ld := range dispatchers {
+		if ld == nil || ld == current {
+			continue
+		}
+		if emailToUID == nil {
+			emailToUID, deviceLimits, credentials = dispatcherUserSet(users, enforceDeviceLimit)
+		}
+		// The maps are only read after installation, so sharing is safe.
+		ld.UpdateLimits(emailToUID, deviceLimits, credentials)
+	}
+}
+
+// dispatcherUserSet builds the LimitDispatcher maps for users. Both the
+// stats email and the UUID map to the user ID.
+func dispatcherUserSet(users []model.UserSpec, enforceDeviceLimit bool) (emailToUID, deviceLimits map[string]int, credentials map[string]string) {
+	emailToUID = make(map[string]int, len(users)*2)
+	deviceLimits = make(map[string]int)
+	credentials = make(map[string]string, len(users))
 	for _, u := range users {
 		email := userEmail(u.ID)
 		emailToUID[email] = u.ID
 		emailToUID[u.UUID] = u.ID
-		if x.cfg.DeviceLimitEnforce && u.DeviceLimit > 0 {
+		credentials[email] = normalizeCredential(u.UUID)
+		if enforceDeviceLimit && u.DeviceLimit > 0 {
 			deviceLimits[email] = u.DeviceLimit
 			deviceLimits[u.UUID] = u.DeviceLimit
 		}
 	}
+	return emailToUID, deviceLimits, credentials
+}
 
-	ld.UpdateLimits(emailToUID, deviceLimits, nil)
+func (x *Xray) configureDispatcher(ld *LimitDispatcher, nc *model.NodeSpec, users []model.UserSpec) {
+	if ld == nil {
+		return
+	}
+	emailToUID, deviceLimits, credentials := dispatcherUserSet(users, x.cfg.DeviceLimitEnforce)
+	ld.UpdateLimits(emailToUID, deviceLimits, credentials)
 	if x.audit != nil {
 		logger := ld.auditLog()
 		if logger == nil {

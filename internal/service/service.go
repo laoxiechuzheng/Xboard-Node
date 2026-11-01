@@ -39,7 +39,9 @@ type Service struct {
 	limiter      *limiter.Limiter
 	speedTracker *limiter.SpeedTracker
 	cert         *cert.Manager
-	auditClient  *audit.Handle
+	// certRenewedFn replaces cert.CertRenewed in tests; nil uses the manager.
+	certRenewedFn func() bool
+	auditClient   *audit.Handle
 
 	lastConfig *model.NodeSpec
 	lastUsers  []model.UserSpec
@@ -62,12 +64,32 @@ type Service struct {
 	pullBackoff    apiBackoff // backoff for panel pull failures
 	pushBackoff    apiBackoff // backoff for panel push failures
 
-	// pushActive prevents overlapping push/pull goroutines.
+	// pushActive prevents overlapping push goroutines.
 	pushActive atomic.Bool
-	pullActive atomic.Bool
 	pushWG     sync.WaitGroup
-	// pullResults delivers async pullViaAPI results back to the main goroutine.
+	// pullMu guards pullActive (a pull goroutine is in flight, so pulls never
+	// overlap) and pullRerun (a resync pull arrived during that pull and must
+	// run once it finishes).
+	pullMu     sync.Mutex
+	pullActive bool
+	pullRerun  bool
+	// pullResults delivers async pull results back to the main goroutine.
 	pullResults chan pullResult
+	// userEventSeq counts pushed user events (sync.users, sync.user.delta)
+	// handled by the event loop. A pull records it before polling; if it moved
+	// by the time the result is applied, the pulled users may predate state
+	// those events already applied, so they are discarded and re-pulled.
+	userEventSeq atomic.Uint64
+	// configEventSeq counts pushed configs (sync.config) applied by the event
+	// loop. A pulled config read before one of them is older than the config
+	// now running, so it is discarded instead of rolling the kernel back.
+	configEventSeq atomic.Uint64
+	// stalePullDiscards counts consecutive pull results that carried stale
+	// data (main goroutine only). Each one schedules a jittered re-pull, up to
+	// maxStalePullRepulls in a row; after that the periodic pull reconciles.
+	stalePullDiscards int
+	// stalePullJitter bounds the random delay before that re-pull.
+	stalePullJitter time.Duration
 
 	wsClient        controlplane.PushClient        // Push client (nil if push is not enabled)
 	wsEvents        chan controlplane.Event        // receives data events from push transport
@@ -86,45 +108,47 @@ type Service struct {
 	metricsMu sync.RWMutex
 }
 
-// pullResult carries the outcome of an async pullViaAPI back to the main goroutine.
+// pullResult carries the outcome of an async pull back to the main goroutine.
 type pullResult struct {
-	config      *model.NodeSpec
-	users       []model.UserSpec
-	configHash  string
-	userHash    string
-	certChanged bool
+	config     *model.NodeSpec
+	users      []model.UserSpec
+	configHash string
+	userHash   string
+	// userEventSeq and configEventSeq are the Service counters when the pull
+	// started.
+	userEventSeq   uint64
+	configEventSeq uint64
 }
 
-// apiBackoff implements simple exponential backoff for API failures.
+// apiBackoff skips the next periodic attempt after a failed one. Attempts
+// only run when no skip is pending, so consecutive failures never widen the
+// gap: this is a fixed skip-one, not an exponential backoff. Resync pulls
+// bypass it.
 type apiBackoff struct {
-	mu            sync.Mutex
-	skipRemaining int
+	mu      sync.Mutex
+	skipOne bool
 }
 
+// shouldSkip reports whether this periodic attempt is skipped and consumes
+// the pending skip.
 func (b *apiBackoff) shouldSkip() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.skipRemaining > 0 {
-		b.skipRemaining--
-		return true
-	}
-	return false
+	skip := b.skipOne
+	b.skipOne = false
+	return skip
 }
 
 func (b *apiBackoff) onSuccess() {
 	b.mu.Lock()
-	b.skipRemaining = 0
+	b.skipOne = false
 	b.mu.Unlock()
 }
 
 func (b *apiBackoff) onFailure() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.skipRemaining <= 0 {
-		b.skipRemaining = 1
-	} else if b.skipRemaining < 8 {
-		b.skipRemaining *= 2
-	}
+	b.skipOne = true
+	b.mu.Unlock()
 }
 
 func New(cfg *config.Config) *Service {
@@ -189,6 +213,8 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 		wsEvents:     make(chan controlplane.Event, 64),
 		wsStatusCh:   make(chan controlplane.StatusChange, 16),
 		pullResults:  make(chan pullResult, 1),
+
+		stalePullJitter: wsPullJitter,
 	}
 }
 
@@ -478,7 +504,7 @@ func (s *Service) requestWSResync(ctx context.Context, reason string) {
 	} else {
 		nlog.Core().Warn("ws state may be stale, scheduling REST reconciliation", "reason", reason)
 	}
-	s.schedulePullAsync(ctx, wsPullJitter)
+	s.scheduleResyncAsync(ctx, wsPullJitter)
 }
 
 // wsPullJitter spreads REST reconciliation pulls after WS events across a few
@@ -486,11 +512,11 @@ func (s *Service) requestWSResync(ctx context.Context, reason string) {
 // hits the panel API simultaneously, causing CPU/traffic spikes.
 const wsPullJitter = 5 * time.Second
 
-// schedulePullAsync runs pullViaAPIAsync after a random delay in
+// scheduleResyncAsync runs resyncViaAPIAsync after a random delay in
 // [0, maxJitter]. A zero maxJitter pulls immediately.
-func (s *Service) schedulePullAsync(ctx context.Context, maxJitter time.Duration) {
+func (s *Service) scheduleResyncAsync(ctx context.Context, maxJitter time.Duration) {
 	if maxJitter <= 0 {
-		s.pullViaAPIAsync(ctx)
+		s.resyncViaAPIAsync(ctx)
 		return
 	}
 	delay := time.Duration(rand.Int64N(int64(maxJitter) + 1))
@@ -502,7 +528,7 @@ func (s *Service) schedulePullAsync(ctx context.Context, maxJitter time.Duration
 		case <-ctx.Done():
 			return
 		}
-		s.pullViaAPIAsync(ctx)
+		s.resyncViaAPIAsync(ctx)
 	}()
 }
 
@@ -553,7 +579,7 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 		}
 		// After reconnect, proactively pull once to ensure we haven't missed
 		// any updates during the disconnection window.
-		s.schedulePullAsync(ctx, wsPullJitter)
+		s.scheduleResyncAsync(ctx, wsPullJitter)
 		// The panel clears node devices on disconnect and only restores them
 		// when the node reports again. Force a full device snapshot now so the
 		// global online-device count recovers immediately instead of waiting
@@ -573,7 +599,7 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 		}
 		// Clear global device state on disconnect
 		s.kernel.ClearGlobalDevices()
-		s.schedulePullAsync(ctx, wsPullJitter)
+		s.scheduleResyncAsync(ctx, wsPullJitter)
 	}
 }
 
@@ -609,7 +635,7 @@ func (s *Service) wsDiscovery(ctx context.Context) {
 		return
 	}
 	if s.source.SupportsPolling() {
-		s.pullViaAPIAsync(ctx)
+		s.resyncViaAPIAsync(ctx)
 	}
 
 	if pushClient != nil {
@@ -658,6 +684,12 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		s.lastConfig = event.Config
 		s.metricsMu.Unlock()
 		s.lastConfigHash = newConfigHash
+		s.configEventSeq.Add(1)
+		// The running config now differs from the last REST snapshot. Keeping
+		// its ETag would let a panel that returns to that snapshot (ABA, with
+		// the reverse push lost) answer the next reconciliation pull with 304,
+		// leaving this config in place.
+		s.invalidateConfigCache()
 		s.applyRemoteOverrides(ctx, event.Config)
 		s.applyChanges(ctx, true, false)
 
@@ -665,10 +697,12 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		if event.Users == nil {
 			return
 		}
+		s.userEventSeq.Add(1)
 		newHash := computeUserHash(event.Users)
 		if newHash == s.lastUserHash {
 			return
 		}
+		s.invalidateUserCache()
 		if s.nodeLog != nil {
 			s.nodeLog.Info(fmt.Sprintf("users updated, %d users", len(event.Users)))
 		}
@@ -678,10 +712,15 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		if len(event.DeltaUsers) == 0 {
 			return
 		}
+		s.userEventSeq.Add(1)
 		if s.nodeLog != nil {
 			s.nodeLog.Info(fmt.Sprintf("users delta: %s, %d users", event.DeltaAction, len(event.DeltaUsers)))
 		}
+		prevHash := s.lastUserHash
 		s.applyUserDelta(ctx, event.DeltaAction, event.DeltaUsers)
+		if s.lastUserHash != prevHash {
+			s.invalidateUserCache()
+		}
 
 	case controlplane.EventSyncDevices:
 		// Sync global device state
@@ -694,27 +733,104 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 	}
 }
 
-// pullViaAPIAsync fetches config/users from the panel API in a background
-// goroutine and sends the result to pullResults for the main goroutine to apply.
+// invalidateUserCache drops the users ETag so the next pull returns the full
+// list. It runs when pulled users are not applied, and after a pushed user
+// event changed local users: they may then differ from the last REST
+// snapshot, and a panel set that returns to that snapshot (ABA) would answer
+// 304, so the next pull could not repair a missed reverse event. A pushed
+// event that changes nothing keeps the ETag, so the full sync.users the
+// panel sends on every WS reconnect does not turn the reconnect pull into a
+// full download. Pulls already in flight are covered separately: every
+// pushed user event bumps userEventSeq, and applyPullResult discards their
+// users.
+func (s *Service) invalidateUserCache() {
+	if s.source != nil {
+		s.source.InvalidateUserCache()
+	}
+}
+
+// invalidateConfigCache drops the config ETag so the next pull returns the
+// full config. It runs when a pulled config is not applied, and after a
+// pushed sync.config changed the running config.
+func (s *Service) invalidateConfigCache() {
+	if s.source != nil {
+		s.source.InvalidateConfigCache()
+	}
+}
+
+// certRenewed consumes the pending certificate renewal flag.
+func (s *Service) certRenewed() bool {
+	if s.certRenewedFn != nil {
+		return s.certRenewedFn()
+	}
+	return s.cert != nil && s.cert.CertRenewed()
+}
+
+// maxStalePullRepulls caps consecutive re-pulls after stale pull results.
+// WS deltas reach every node of a group at once, so without a cap a burst of
+// them faster than a REST round trip keeps every node re-downloading its full
+// list. Past the cap the periodic pull reconciles; the dropped ETags make it
+// return full data.
+const maxStalePullRepulls = 3
+
+// repullAfterStale schedules a jittered resync after applyPullResult dropped
+// stale data from a pull result.
+func (s *Service) repullAfterStale(ctx context.Context, staleConfig, staleUsers bool) {
+	s.stalePullDiscards++
+	if s.stalePullDiscards > maxStalePullRepulls {
+		nlog.Core().Warn("discarded stale pull data again, leaving reconciliation to the periodic pull",
+			"stale_config", staleConfig, "stale_users", staleUsers, "discards", s.stalePullDiscards)
+		return
+	}
+	nlog.Core().Info("discarded stale pull data, re-pulling",
+		"stale_config", staleConfig, "stale_users", staleUsers, "discards", s.stalePullDiscards)
+	s.scheduleResyncAsync(ctx, s.stalePullJitter)
+}
+
+// pullViaAPIAsync starts a periodic pull: it honours the failure backoff and
+// is dropped while another pull is in flight.
 func (s *Service) pullViaAPIAsync(ctx context.Context) {
+	s.startPull(ctx, false)
+}
+
+// resyncViaAPIAsync starts a reconciliation pull (WS connect/disconnect,
+// dropped WS events, discovery, a discarded stale pull). It bypasses the
+// failure backoff, and when a pull is already in flight it runs again right
+// after that one, since the in-flight pull may have read the panel too early.
+func (s *Service) resyncViaAPIAsync(ctx context.Context) {
+	s.startPull(ctx, true)
+}
+
+// startPull fetches config/users from the panel API in a background
+// goroutine and sends the result to pullResults for the main goroutine to
+// apply. Jittered resyncs call it off the main goroutine, so it only touches
+// state that is safe to share; applyPullResult does the hash comparisons.
+func (s *Service) startPull(ctx context.Context, resync bool) {
 	if !s.source.SupportsPolling() {
 		return
 	}
-	if !s.pullActive.CompareAndSwap(false, true) {
-		nlog.Core().Debug("pull already in progress, skipping")
+	s.pullMu.Lock()
+	if s.pullActive {
+		if resync {
+			s.pullRerun = true
+		}
+		s.pullMu.Unlock()
+		nlog.Core().Debug("pull already in progress, skipping", "resync", resync)
 		return
 	}
-	if s.pullBackoff.shouldSkip() {
+	if !resync && s.pullBackoff.shouldSkip() {
+		s.pullMu.Unlock()
 		nlog.Core().Debug("skipping pull due to backoff")
-		s.pullActive.Store(false)
 		return
 	}
+	s.pullActive = true
+	s.pullMu.Unlock()
 
-	currentConfigHash := s.lastConfigHash
-	certChanged := s.cert.CertRenewed()
+	userSeq := s.userEventSeq.Load()
+	configSeq := s.configEventSeq.Load()
 
 	go func() {
-		defer s.pullActive.Store(false)
+		defer s.finishPull(ctx)
 		snapshot, err := s.source.Poll(ctx)
 		if err != nil {
 			nlog.Core().Error("poll control plane failed", "error", err)
@@ -722,14 +838,16 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 			return
 		}
 		s.pullBackoff.onSuccess()
+		if snapshot.ConfigErr != nil {
+			// The users are still valid and applied; the source re-fetches
+			// the config on every pull until it is fixed.
+			nlog.Core().Error("control plane config rejected, keeping the running config", "error", snapshot.ConfigErr)
+		}
 
-		result := pullResult{certChanged: certChanged}
+		result := pullResult{userEventSeq: userSeq, configEventSeq: configSeq}
 		if snapshot.Config != nil {
 			result.config = snapshot.Config
 			result.configHash = computeConfigHash(snapshot.Config)
-			if result.configHash == currentConfigHash && !certChanged {
-				result.config = nil
-			}
 		}
 		if snapshot.Users != nil {
 			result.users = snapshot.Users
@@ -739,16 +857,65 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 		select {
 		case s.pullResults <- result:
 		case <-ctx.Done():
+			// The poll stored ETags for data that is never applied.
+			s.invalidateConfigCache()
+			s.invalidateUserCache()
 		}
 	}()
 }
 
-// applyPullResult processes the result of an async pullViaAPI on the main goroutine.
+// finishPull ends the in-flight pull and starts the resync pull requested
+// meanwhile, if any.
+func (s *Service) finishPull(ctx context.Context) {
+	s.pullMu.Lock()
+	rerun := s.pullRerun
+	s.pullActive = false
+	s.pullRerun = false
+	s.pullMu.Unlock()
+	if rerun && ctx.Err() == nil {
+		s.startPull(ctx, true)
+	}
+}
+
+// applyPullResult processes the result of an async pull on the main goroutine.
 func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	s.wsResyncPending.Store(false)
 	configChanged := false
+	// Consumed here rather than when the pull starts, so a failed pull or a
+	// result dropped at shutdown leaves a pending renewal for the next one.
+	certChanged := s.certRenewed()
 
-	if result.certChanged {
+	staleConfig := result.config != nil && result.configEventSeq != s.configEventSeq.Load() &&
+		result.configHash != s.lastConfigHash
+	if staleConfig {
+		// A WS sync.config was applied after this pull read the panel, so the
+		// pulled config may be older than the running one: applying it would
+		// restart the kernel with the old config. Drop it (a pending cert
+		// renewal still restarts with the current config) and drop its ETag,
+		// in case it was newer after all.
+		result.config = nil
+		s.invalidateConfigCache()
+	}
+	if result.config != nil && result.configHash == s.lastConfigHash && !certChanged {
+		result.config = nil
+	}
+
+	staleUsers := result.users != nil && result.userEventSeq != s.userEventSeq.Load()
+	if staleUsers {
+		// WS user events were applied after this pull read the panel, so the
+		// pulled list may predate them: applying it could restore a removed
+		// user or roll back a uuid reset. Drop the users and their ETag.
+		result.users = nil
+		s.invalidateUserCache()
+	}
+
+	if staleConfig || staleUsers {
+		s.repullAfterStale(ctx, staleConfig, staleUsers)
+	} else {
+		s.stalePullDiscards = 0
+	}
+
+	if certChanged {
 		nlog.Core().Info("certificate renewed, kernel restart needed")
 		configChanged = true
 	}
@@ -757,6 +924,8 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 		if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), result.config, s.cert.TLSCert()); err != nil {
 			nlog.Core().Warn("runtime config validation failed", "error", err)
 			result.config = nil
+			// Keep retrying the config instead of answering 304 for it.
+			s.invalidateConfigCache()
 		} else {
 			configChanged = true
 			// Initialize or update node logger
@@ -781,6 +950,13 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 			s.applyUserUpdate(ctx, result.users, result.userHash)
 		} else if usersChanged {
 			s.updateUserState(result.users)
+		}
+		if s.machineMailbox != nil {
+			// The mailbox folds WS deltas into its own user list and drains it
+			// as a full snapshot, so it must start from the panel's current
+			// list; a stale baseline would undo REST-only changes on the next
+			// delta.
+			s.machineMailbox.ReplaceBaseline(result.users)
 		}
 	}
 
@@ -905,18 +1081,13 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		}
 		merged := mergeUsers(s.lastUsers, deltaUsers)
 
-		if !s.kernel.IsRunning() {
+		// A uuid change (e.g. a subscription reset) goes through the full
+		// update: UpdateUsers swaps the old uuid for the new one in a single
+		// diff and restarts the kernel if that fails. Removing the old uuid
+		// first could empty and stop a one-user kernel before the add.
+		if !s.kernel.IsRunning() || changesUUID(s.lastUsers, deltaUsers) {
 			s.applyUserUpdate(ctx, merged, "")
 			return
-		}
-
-		for _, delta := range deltaUsers {
-			for _, old := range s.lastUsers {
-				if old.ID == delta.ID && old.UUID != delta.UUID {
-					s.kernel.RemoveUsers([]model.UserSpec{old})
-					break
-				}
-			}
 		}
 
 		prevUsers, prevHash := s.prepareUserState(merged)
@@ -962,6 +1133,20 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 	default:
 		nlog.Core().Warn(fmt.Sprintf("unknown user delta action: %s", action))
 	}
+}
+
+// changesUUID reports whether delta carries a known user ID with a new uuid.
+func changesUUID(base, delta []model.UserSpec) bool {
+	uuids := make(map[int]string, len(base))
+	for _, u := range base {
+		uuids[u.ID] = u.UUID
+	}
+	for _, u := range delta {
+		if old, ok := uuids[u.ID]; ok && old != u.UUID {
+			return true
+		}
+	}
+	return false
 }
 
 // mergeUsers overlays deltaUsers onto base (keyed by ID). New users are

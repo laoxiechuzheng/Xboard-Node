@@ -162,3 +162,116 @@ func TestNodeMailboxDeltaFailedApplyNotifies(t *testing.T) {
 		t.Fatal("expected NeedsReconcile for invalid delta action")
 	}
 }
+
+func mailboxUserIDs(users []model.UserSpec) map[int]string {
+	ids := make(map[int]string, len(users))
+	for _, user := range users {
+		ids[user.ID] = user.UUID
+	}
+	return ids
+}
+
+func TestNodeMailboxReplaceBaselineDropsRESTRemovedUsers(t *testing.T) {
+	mb := NewNodeMailbox()
+	mb.SeedBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 2, UUID: "u2"}}, nil)
+	mb.MarkReady()
+	mb.DrainIfReady()
+
+	// A REST pull removed user 2 (e.g. expiry, which pushes no delta).
+	mb.ReplaceBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}})
+	if state := mb.DrainIfReady(); state.HasUsers {
+		t.Fatalf("replacing the baseline alone must not emit users: %+v", state)
+	}
+
+	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "add", DeltaUsers: []model.UserSpec{{ID: 3, UUID: "u3"}}})
+	state := mb.DrainIfReady()
+	got := mailboxUserIDs(state.Users)
+	if !state.HasUsers || len(got) != 2 || got[1] != "u1" || got[3] != "u3" {
+		t.Fatalf("delta after REST baseline = %+v, want users 1 and 3 only", state.Users)
+	}
+}
+
+func TestNodeMailboxReplaceBaselineReplaysUndrainedDeltas(t *testing.T) {
+	mb := NewNodeMailbox()
+	mb.SeedBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 2, UUID: "u2"}}, nil)
+	mb.MarkReady()
+	mb.DrainIfReady()
+
+	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "add", DeltaUsers: []model.UserSpec{{ID: 3, UUID: "u3"}}})
+	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "remove", DeltaUsers: []model.UserSpec{{ID: 1}}})
+	mb.ReplaceBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 4, UUID: "u4"}})
+
+	state := mb.DrainIfReady()
+	got := mailboxUserIDs(state.Users)
+	if !state.HasUsers || len(got) != 2 || got[3] != "u3" || got[4] != "u4" {
+		t.Fatalf("drained users = %+v, want REST baseline plus undrained deltas (3, 4)", state.Users)
+	}
+
+	// Drained deltas must not be replayed onto a later baseline.
+	mb.ReplaceBaseline([]model.UserSpec{{ID: 5, UUID: "u5"}})
+	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "add", DeltaUsers: []model.UserSpec{{ID: 6, UUID: "u6"}}})
+	got = mailboxUserIDs(mb.DrainIfReady().Users)
+	if len(got) != 2 || got[5] != "u5" || got[6] != "u6" {
+		t.Fatalf("drained users = %+v, want 5 and 6 only", got)
+	}
+}
+
+func TestNodeMailboxReplaceBaselineKeepsUndrainedFullSnapshot(t *testing.T) {
+	mb := NewNodeMailbox()
+	mb.SeedBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}}, nil)
+	mb.MarkReady()
+	mb.DrainIfReady()
+
+	mb.Apply(Event{Type: EventSyncUsers, Users: []model.UserSpec{{ID: 7, UUID: "u7"}}})
+	mb.ReplaceBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}})
+
+	got := mailboxUserIDs(mb.DrainIfReady().Users)
+	if len(got) != 1 || got[7] != "u7" {
+		t.Fatalf("drained users = %+v, want the undrained WS full snapshot", got)
+	}
+}
+
+// Removing the last user by delta leaves an empty, non-nil list: the service
+// ignores a nil list, so a nil here would keep the removed user online.
+func TestNodeMailboxDeltaRemovingLastUserDrainsEmptyList(t *testing.T) {
+	mb := NewNodeMailbox()
+	mb.SeedBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}}, nil)
+	mb.MarkReady()
+	mb.DrainIfReady()
+
+	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "remove", DeltaUsers: []model.UserSpec{{ID: 1}}})
+	state := mb.DrainIfReady()
+	if !state.HasUsers || state.Users == nil || len(state.Users) != 0 {
+		t.Fatalf("drained users = %#v (has=%v), want an empty non-nil list", state.Users, state.HasUsers)
+	}
+
+	// A later delta still applies on top of the empty list.
+	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "add", DeltaUsers: []model.UserSpec{{ID: 2, UUID: "u2"}}})
+	if got := mailboxUserIDs(mb.DrainIfReady().Users); len(got) != 1 || got[2] != "u2" {
+		t.Fatalf("drained users = %v, want user 2", got)
+	}
+}
+
+func TestNodeMailboxReplaceBaselineReplayRemovingLastUserDrainsEmptyList(t *testing.T) {
+	mb := NewNodeMailbox()
+	mb.SeedBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 2, UUID: "u2"}}, nil)
+	mb.MarkReady()
+	mb.DrainIfReady()
+
+	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "remove", DeltaUsers: []model.UserSpec{{ID: 1}}})
+	mb.ReplaceBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}})
+	state := mb.DrainIfReady()
+	if !state.HasUsers || state.Users == nil || len(state.Users) != 0 {
+		t.Fatalf("drained users = %#v (has=%v), want an empty non-nil list", state.Users, state.HasUsers)
+	}
+}
+
+func TestNodeMailboxEmptyFullSnapshotDrainsEmptyList(t *testing.T) {
+	mb := NewNodeMailbox()
+	mb.MarkReady()
+	mb.Apply(Event{Type: EventSyncUsers, Users: []model.UserSpec{}})
+	state := mb.DrainIfReady()
+	if !state.HasUsers || state.Users == nil || len(state.Users) != 0 {
+		t.Fatalf("drained users = %#v (has=%v), want an empty non-nil list", state.Users, state.HasUsers)
+	}
+}

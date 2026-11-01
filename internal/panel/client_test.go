@@ -262,6 +262,44 @@ func TestResetETags(t *testing.T) {
 	client.GetConfig()
 }
 
+func TestResetUserETagKeepsConfigETag(t *testing.T) {
+	var userTags, configTags []string
+	ts, client := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/server/UniProxy/user":
+			userTags = append(userTags, r.Header.Get("If-None-Match"))
+			w.Header().Set("ETag", `"users-1"`)
+			json.NewEncoder(w).Encode(UsersResponse{Users: []User{{ID: 1, UUID: "u1"}}})
+		case "/api/v1/server/UniProxy/config":
+			configTags = append(configTags, r.Header.Get("If-None-Match"))
+			w.Header().Set("ETag", `"config-1"`)
+			json.NewEncoder(w).Encode(NodeConfig{Protocol: "ss"})
+		}
+	})
+	defer ts.Close()
+
+	if _, err := client.GetUsers(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.GetConfig(); err != nil {
+		t.Fatal(err)
+	}
+	client.ResetUserETag()
+	if _, err := client.GetUsers(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.GetConfig(); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(userTags) != 2 || userTags[1] != "" {
+		t.Fatalf("users If-None-Match after reset = %q, want empty", userTags)
+	}
+	if len(configTags) != 2 || configTags[1] != `"config-1"` {
+		t.Fatalf("config If-None-Match = %q, want config ETag kept", configTags)
+	}
+}
+
 func TestPushTraffic_ServerError(t *testing.T) {
 	ts, client := newTestServer(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)

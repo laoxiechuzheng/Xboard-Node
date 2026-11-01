@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -126,10 +127,18 @@ type ConnTracker struct {
 	usersMu sync.RWMutex
 	users   map[int]*userStats       // userID → stats
 	uuidMap map[string]int           // UUID → userID (for lookup in RoutedConnection)
+	idUUID  map[int]string           // userID → UUID (naive authenticates by user ID)
 	connMap map[string]*trackedEntry // connID → live TCP conn (force-close + idle janitor)
 
+	// userConns indexes every live TCP and UDP connection of a known user by
+	// the UUID it authenticated with, so removing or replacing that UUID cuts
+	// the connections instead of letting them run on unaccounted.
+	userConns map[string]*liveUserConns
+
 	// Retain UUID ownership for this instance so an old QUIC session cannot
-	// become a different panel account after a remove/add cycle.
+	// become a different panel account after a remove/add cycle. A UUID that
+	// ever changed owner is recorded as 0 and refused on HY2/TUIC, whose
+	// sessions authenticate by slot (see resolveUserLocked).
 	uuidOwners map[string]int
 	idCounter  atomic.Int64
 
@@ -158,7 +167,9 @@ func NewConnTracker(idleTimeout time.Duration) *ConnTracker {
 	return &ConnTracker{
 		users:         make(map[int]*userStats),
 		uuidMap:       make(map[string]int),
+		idUUID:        make(map[int]string),
 		connMap:       make(map[string]*trackedEntry),
+		userConns:     make(map[string]*liveUserConns),
 		uuidOwners:    make(map[string]int),
 		globalDevices: make(map[int]map[string]bool),
 		idleTimeout:   idleTimeout,
@@ -177,6 +188,17 @@ func (e *trackedEntry) touch() {
 	e.lastSeen.Store(time.Now().UnixNano())
 }
 
+// liveUserConns is the set of live connections authenticated as one UUID.
+type liveUserConns struct {
+	userID int
+	conns  map[string]userConn // connID → conn
+}
+
+// userConn is a tracked connection that can be cut when its user is removed.
+type userConn interface {
+	kick()
+}
+
 // SetSpeedLimitFunc configures the per-user speed limit lookup.
 func (t *ConnTracker) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) {
 	t.speedLimitFunc.Store(&fn)
@@ -189,25 +211,115 @@ func (t *ConnTracker) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
 
 // SetUserMap replaces the UUID→userID mapping and ensures per-user stats
 // structs exist for all users. Old users that are no longer present keep
-// their stats until their connections drain.
+// their stats (traffic not yet reported), but every live connection that
+// authenticated with a UUID no longer mapped to the same user — a removed
+// user, or the old UUID of a reset subscription — is closed, and
+// RoutedConnection refuses new connections presenting it.
+//
+// Callers publish the map BEFORE the inbounds change their credentials: a
+// just-added user is then never refused, and a just-removed user that still
+// authenticates against the not-yet-updated inbound is refused here.
 func (t *ConnTracker) SetUserMap(m map[string]int) {
 	t.usersMu.Lock()
 	t.uuidMap = make(map[string]int, len(m))
+	t.idUUID = make(map[int]string, len(m))
 	for uuid, uid := range m {
 		if uuid == "" || uid <= 0 {
 			continue
 		}
-		if owner, known := t.uuidOwners[uuid]; known && owner != uid {
+		if owner, known := t.uuidOwners[uuid]; !known {
+			t.uuidOwners[uuid] = uid
+		} else if owner != uid {
 			t.uuidOwners[uuid] = 0
-			continue
 		}
-		t.uuidOwners[uuid] = uid
+		// The current owner is resolvable everywhere; only slot-based
+		// inbounds keep refusing a UUID that changed owner.
 		t.uuidMap[uuid] = uid
+		t.idUUID[uid] = uuid
 		if _, ok := t.users[uid]; !ok {
 			t.users[uid] = &userStats{ips: make(map[string]int)}
 		}
 	}
+	// Revoked connections leave the index here, under the lock, so a later
+	// SetUserMap or CloseByUUID cannot collect them again while their
+	// background close is still running: each one is kicked exactly once.
+	var revoked []userConn
+	for uuid, set := range t.userConns {
+		if t.uuidMap[uuid] != set.userID {
+			for _, conn := range set.conns {
+				revoked = append(revoked, conn)
+			}
+			delete(t.userConns, uuid)
+		}
+	}
 	t.usersMu.Unlock()
+	if len(revoked) > 0 {
+		nlog.Core().Info("singbox: closing connections of removed users", "connections", len(revoked))
+		kickAll(revoked)
+	}
+}
+
+// kickAll closes conns in the background: a TLS close can block on a full
+// send buffer for seconds, and callers hold the kernel lock.
+func kickAll(conns []userConn) {
+	for _, conn := range conns {
+		go conn.kick()
+	}
+}
+
+// resolveUserLocked maps the inbound's authenticated user name to the panel
+// UUID it stands for and that UUID's current user. Every inbound names users
+// by UUID except naive, whose username is the numeric user ID (buildNaive).
+// Must be called with usersMu held.
+func (t *ConnTracker) resolveUserLocked(metadata adapter.InboundContext) (uuid string, uid int, us *userStats) {
+	uuid = metadata.User
+	if metadata.InboundType == "naive" && uuid != "" {
+		if id, err := strconv.Atoi(uuid); err == nil {
+			uuid = t.idUUID[id]
+		}
+	}
+	if uuid == "" {
+		return "", 0, nil
+	}
+	uid, known := t.uuidMap[uuid]
+	if !known || uid <= 0 {
+		return uuid, 0, nil
+	}
+	// HY2 and TUIC bind a live session to a slot whose name is the UUID: a
+	// UUID that moved to another user could hand an old session to the new
+	// owner, so it stays refused there until the next full Start.
+	if (metadata.InboundType == "hysteria2" || metadata.InboundType == "tuic") && t.uuidOwners[uuid] != uid {
+		return uuid, 0, nil
+	}
+	return uuid, uid, t.users[uid]
+}
+
+// refusesUnknown reports whether a connection must be refused because its
+// authenticated user is not (or no longer) a current user. Inbounds that do
+// not authenticate users leave metadata.User empty and are served as before;
+// HY2 and TUIC always authenticate, so an empty user there is a retired slot.
+func refusesUnknown(metadata adapter.InboundContext, us *userStats) bool {
+	if us != nil {
+		return false
+	}
+	return metadata.User != "" || metadata.InboundType == "hysteria2" || metadata.InboundType == "tuic"
+}
+
+// registerLocked indexes a live connection under its UUID. It fails when the
+// UUID was removed after RoutedConnection resolved it, so SetUserMap cannot
+// miss a connection that was being set up concurrently.
+// Must be called with usersMu held for writing.
+func (t *ConnTracker) registerLocked(uuid string, uid int, connID string, conn userConn) bool {
+	if t.uuidMap[uuid] != uid {
+		return false
+	}
+	set := t.userConns[uuid]
+	if set == nil {
+		set = &liveUserConns{userID: uid, conns: make(map[string]userConn)}
+		t.userConns[uuid] = set
+	}
+	set.conns[connID] = conn
+	return true
 }
 
 func (t *ConnTracker) SetAuditSink(sink audit.Sink, nodeID int, protocol string) {
@@ -252,25 +364,21 @@ func (t *ConnTracker) RoutedConnection(
 	metadata adapter.InboundContext,
 	_ adapter.Rule, _ adapter.Outbound,
 ) net.Conn {
-	uuid := metadata.User
 	sourceIP := metadata.Source.Addr.String()
 
 	t.usersMu.RLock()
-	uid, known := t.uuidMap[uuid]
-	var us *userStats
-	if known && uid > 0 {
-		us = t.users[uid]
-	}
+	uuid, uid, us := t.resolveUserLocked(metadata)
 	auditSink, auditNodeID, auditProtocol := t.auditSink, t.auditNodeID, t.auditProtocol
 	t.usersMu.RUnlock()
 
-	// HY2 and TUIC authenticate by slot index: a user that is not in the map is
-	// a retired or ambiguous slot and must never be served or attributed.
-	if metadata.InboundType == "hysteria2" || metadata.InboundType == "tuic" {
-		if us == nil {
-			_ = conn.Close()
-			return conn
-		}
+	// A user that is not in the map was removed, had its UUID reset, or is a
+	// retired/ambiguous slot: it must never be served or go unaccounted. This
+	// also refuses new streams of a session that authenticated before the
+	// removal (AnyTLS sessions, multiplexed streams, QUIC connections).
+	if refusesUnknown(metadata, us) {
+		closeAnyTLSSession(conn)
+		_ = conn.Close()
+		return conn
 	}
 	if metadata.InboundType == "hysteria2" {
 		auditProtocol = "hysteria2"
@@ -315,45 +423,43 @@ func (t *ConnTracker) RoutedConnection(
 		userID:   uid,
 		connID:   connID,
 		sourceIP: sourceIP,
+		uuid:     uuid,
 		limiter:  lim,
 		entry:    entry,
 		ctx:      ctx,
 	}
 	entry.conn = tc
 	t.usersMu.Lock()
+	if us != nil && !t.registerLocked(uuid, uid, connID, tc) {
+		t.usersMu.Unlock()
+		tc.kick()
+		return tc
+	}
 	t.connMap[connID] = entry
 	t.usersMu.Unlock()
 	return tc
 }
 
-// RoutedPacketConnection wraps UDP with per-user counting (UDP not in connMap).
-// Note: UDP connections are NOT stored in connMap because connMap is typed as
-// map[string]net.Conn, but PacketConn is a different interface. Force-close
-// for UDP connections is handled directly via trackedPacketConn.Close().
+// RoutedPacketConnection wraps UDP with per-user counting. UDP connections
+// are not in connMap (the idle janitor is TCP-only) but are indexed per user
+// in userConns, so removing a user closes them too.
 func (t *ConnTracker) RoutedPacketConnection(
 	ctx context.Context, conn N.PacketConn,
 	metadata adapter.InboundContext,
 	_ adapter.Rule, _ adapter.Outbound,
 ) N.PacketConn {
-	uuid := metadata.User
 	sourceIP := metadata.Source.Addr.String()
 
 	t.usersMu.RLock()
-	uid, known := t.uuidMap[uuid]
-	var us *userStats
-	if known && uid > 0 {
-		us = t.users[uid]
-	}
+	uuid, uid, us := t.resolveUserLocked(metadata)
 	auditSink, auditNodeID, auditProtocol := t.auditSink, t.auditNodeID, t.auditProtocol
 	t.usersMu.RUnlock()
 
-	// HY2 and TUIC authenticate by slot index: a user that is not in the map is
-	// a retired or ambiguous slot and must never be served or attributed.
-	if metadata.InboundType == "hysteria2" || metadata.InboundType == "tuic" {
-		if us == nil {
-			_ = conn.Close()
-			return conn
-		}
+	// Same rule as RoutedConnection: unknown users are never served.
+	if refusesUnknown(metadata, us) {
+		closeAnyTLSSession(conn)
+		_ = conn.Close()
+		return conn
 	}
 	if metadata.InboundType == "hysteria2" {
 		auditProtocol = "hysteria2"
@@ -385,16 +491,26 @@ func (t *ConnTracker) RoutedPacketConnection(
 		lim = (*slf)(uuid)
 	}
 
-	return &trackedPacketConn{
+	tc := &trackedPacketConn{
 		PacketConn: conn,
 		tracker:    t,
 		us:         us,
 		userID:     uid,
 		connID:     connID,
 		sourceIP:   sourceIP,
+		uuid:       uuid,
 		limiter:    lim,
 		ctx:        ctx,
 	}
+	if us != nil {
+		t.usersMu.Lock()
+		registered := t.registerLocked(uuid, uid, connID, tc)
+		t.usersMu.Unlock()
+		if !registered {
+			tc.kick()
+		}
+	}
+	return tc
 }
 
 // checkDeviceGate rejects connections exceeding device limit.
@@ -589,12 +705,24 @@ func (t *ConnTracker) closeIdleConns() {
 	}
 }
 
-// CloseByUUID force-closes ALL connections for a given user UUID.
+// CloseByUUID force-closes every live TCP and UDP connection that
+// authenticated with uuid (and the AnyTLS session carrying it) in the
+// background, and returns how many it is closing. It does not stop the UUID
+// from connecting again: removing it from the user map (SetUserMap) does
+// that, and closes the connections by itself.
 func (t *ConnTracker) CloseByUUID(uuid string) int {
-	// This is a no-op for now — sing-box doesn't expose per-user connection
-	// kill easily. The kernel's RemoveUsers removes the inbound user which
-	// prevents new connections, and existing connections will fail on next I/O.
-	return 0
+	t.usersMu.Lock()
+	var conns []userConn
+	if set := t.userConns[uuid]; set != nil {
+		for _, conn := range set.conns {
+			conns = append(conns, conn)
+		}
+		// Unindex now so each connection is kicked once (see SetUserMap).
+		delete(t.userConns, uuid)
+	}
+	t.usersMu.Unlock()
+	kickAll(conns)
+	return len(conns)
 }
 
 // ActiveCount returns the total number of active connections.
@@ -610,10 +738,17 @@ func (t *ConnTracker) ActiveCount() int {
 	return total
 }
 
-// removeConnRef removes the connection reference from connMap on close.
-func (t *ConnTracker) removeConnRef(connID string) {
+// removeConnRef removes the connection from connMap and the per-user index
+// on close.
+func (t *ConnTracker) removeConnRef(uuid, connID string) {
 	t.usersMu.Lock()
 	delete(t.connMap, connID)
+	if set := t.userConns[uuid]; set != nil {
+		delete(set.conns, connID)
+		if len(set.conns) == 0 {
+			delete(t.userConns, uuid)
+		}
+	}
 	t.usersMu.Unlock()
 }
 
@@ -699,6 +834,7 @@ type trackedConn struct {
 	userID   int        // user ID for device tracking
 	connID   string
 	sourceIP string
+	uuid     string // credential the user authenticated with (userConns key)
 	limiter  *rate.Limiter
 	entry    *trackedEntry // nil for connections created before the idle janitor existed
 	ctx      context.Context
@@ -778,9 +914,16 @@ func (c *trackedConn) Close() error {
 		if c.us != nil {
 			c.us.removeConn(c.sourceIP)
 		}
-		c.tracker.removeConnRef(c.connID)
+		c.tracker.removeConnRef(c.uuid, c.connID)
 	}
 	return c.Conn.Close()
+}
+
+// kick closes the connection of a removed user together with the AnyTLS
+// session carrying it, so the client has to authenticate again.
+func (c *trackedConn) kick() {
+	closeAnyTLSSession(c.Conn)
+	_ = c.Close()
 }
 
 // makeCountFunc builds a CountFunc for zero-copy byte counting via sing's
@@ -845,6 +988,7 @@ type trackedPacketConn struct {
 	userID   int
 	connID   string
 	sourceIP string
+	uuid     string
 	limiter  *rate.Limiter
 	ctx      context.Context
 	closed   atomic.Bool
@@ -911,9 +1055,16 @@ func (c *trackedPacketConn) Close() error {
 		if c.us != nil {
 			c.us.removeConn(c.sourceIP)
 		}
-		c.tracker.removeConnRef(c.connID)
+		c.tracker.removeConnRef(c.uuid, c.connID)
 	}
 	return c.PacketConn.Close()
+}
+
+// kick closes the packet connection of a removed user, and the AnyTLS
+// session of a UDP-over-TCP stream.
+func (c *trackedPacketConn) kick() {
+	closeAnyTLSSession(c.PacketConn)
+	_ = c.Close()
 }
 
 func (c *trackedPacketConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {

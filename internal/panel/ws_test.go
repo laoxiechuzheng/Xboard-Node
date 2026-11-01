@@ -258,6 +258,50 @@ func TestWSClient_NonConfigRoutingIsUnchanged(t *testing.T) {
 	}
 }
 
+func TestWSClient_SyncUsersDistinguishesMissingAndEmpty(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		data      string
+		wantEvent bool
+	}{
+		{name: "missing", data: `{"node_id":17}`},
+		{name: "null", data: `{"node_id":17,"users":null}`},
+		{name: "empty", data: `{"node_id":17,"users":[]}`, wantEvent: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var received []WSEvent
+			w := NewWSClient("", "", 41, WSClientConfig{}, func(event WSEvent) {
+				received = append(received, event)
+			}, nil, nil)
+			w.handleMessage(wsMessage{Event: WSEventSyncUsers, Data: json.RawMessage(tt.data)})
+			if !tt.wantEvent {
+				if len(received) != 0 {
+					t.Fatalf("payload without users must be dropped, got %+v", received)
+				}
+				return
+			}
+			if len(received) != 1 {
+				t.Fatalf("expected one event, got %+v", received)
+			}
+			if received[0].Users == nil || len(received[0].Users) != 0 || received[0].NodeID != 17 {
+				t.Fatalf("empty users must be forwarded as a non-nil empty snapshot, got %+v", received[0])
+			}
+		})
+	}
+}
+
+func TestWSClient_UserDeltaWithoutUsersIsDropped(t *testing.T) {
+	var received []WSEvent
+	w := NewWSClient("", "", 41, WSClientConfig{}, func(event WSEvent) {
+		received = append(received, event)
+	}, nil, nil)
+	w.handleMessage(wsMessage{Event: WSEventSyncUserDelta, Data: json.RawMessage(`{"action":"remove","users":[]}`)})
+	w.handleMessage(wsMessage{Event: WSEventSyncUserDelta, Data: json.RawMessage(`{"action":"remove"}`)})
+	if len(received) != 0 {
+		t.Fatalf("empty user deltas must be dropped, got %+v", received)
+	}
+}
+
 func TestWSClient_ConfigUpdatesKeepIndependentSnapshots(t *testing.T) {
 	var received []WSEvent
 	w := NewWSClient("", "", 41, WSClientConfig{}, func(event WSEvent) {

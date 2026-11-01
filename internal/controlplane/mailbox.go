@@ -31,7 +31,12 @@ type NodeMailbox struct {
 	dirtyDevices     bool
 	needsReconcile   bool
 	hasFullUserState bool
-	notifyCh         chan struct{}
+	// pendingFullUsers is set while users holds an undrained WS full snapshot.
+	pendingFullUsers bool
+	// pendingDeltas are the user deltas folded into users since the last
+	// drain or full snapshot, kept so ReplaceBaseline can replay them.
+	pendingDeltas []Event
+	notifyCh      chan struct{}
 }
 
 func NewNodeMailbox() *NodeMailbox {
@@ -60,6 +65,34 @@ func (m *NodeMailbox) SeedBaseline(users []model.UserSpec, config *model.NodeSpe
 	}
 }
 
+// ReplaceBaseline installs the user list the service just applied from a REST
+// pull. Deltas are folded into the mailbox's own list and drained as a full
+// snapshot, so without this REST-only changes (expiry, a missed push) would be
+// undone by the next delta. Deltas received but not yet drained are replayed
+// on top of the new baseline, and an undrained WS full snapshot is kept as is.
+func (m *NodeMailbox) ReplaceBaseline(users []model.UserSpec) {
+	if users == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pendingFullUsers {
+		// The undrained WS snapshot wins even when this REST list is newer.
+		// For a change the panel never pushes (expiry, traffic exhaustion),
+		// the next drain therefore briefly reinstates a user this pull just
+		// removed, until the following pull removes it again. The window is
+		// short because the drain runs on the same service loop; telling the
+		// two apart would need a generation shared with the WS mux.
+		return
+	}
+	baseline := cloneUsers(users)
+	for _, delta := range m.pendingDeltas {
+		applyUserDelta(&baseline, delta.DeltaAction, delta.DeltaUsers)
+	}
+	m.users = baseline
+	m.hasFullUserState = true
+}
+
 func (m *NodeMailbox) Apply(event Event) {
 	m.mu.Lock()
 	changed := false
@@ -76,6 +109,8 @@ func (m *NodeMailbox) Apply(event Event) {
 			m.users = cloneUsers(event.Users)
 			m.dirtyUsers = true
 			m.hasFullUserState = true
+			m.pendingFullUsers = true
+			m.pendingDeltas = nil
 			changed = true
 		}
 	case EventSyncDevices:
@@ -93,6 +128,11 @@ func (m *NodeMailbox) Apply(event Event) {
 				m.needsReconcile = true
 				changed = true
 			} else {
+				m.pendingDeltas = append(m.pendingDeltas, Event{
+					Type:        EventSyncUserDelta,
+					DeltaAction: event.DeltaAction,
+					DeltaUsers:  cloneUsers(event.DeltaUsers),
+				})
 				m.dirtyUsers = true
 				changed = true
 			}
@@ -127,9 +167,13 @@ func (m *NodeMailbox) DrainIfReady() MailboxState {
 		m.dirtyConfig = false
 	}
 	if m.dirtyUsers {
-		state.Users = cloneUsers(m.users)
+		// A drained list is a full user state: an empty one means "no users"
+		// and must stay non-nil, because the service ignores a nil list.
+		state.Users = cloneUserState(m.users)
 		state.HasUsers = true
 		m.dirtyUsers = false
+		m.pendingFullUsers = false
+		m.pendingDeltas = nil
 	}
 	if m.dirtyDevices && m.deviceUsers != nil {
 		state.DeviceUsers = cloneDeviceUsers(m.deviceUsers)
@@ -209,6 +253,15 @@ func cloneUsers(users []model.UserSpec) []model.UserSpec {
 	return cloned
 }
 
+// cloneUserState copies a full user list, returning an empty non-nil slice
+// for an empty or nil one.
+func cloneUserState(users []model.UserSpec) []model.UserSpec {
+	if users == nil {
+		return []model.UserSpec{}
+	}
+	return cloneUsers(users)
+}
+
 func cloneDeviceUsers(devices map[int][]string) map[int][]string {
 	if devices == nil {
 		return nil
@@ -222,8 +275,11 @@ func cloneDeviceUsers(devices map[int][]string) map[int][]string {
 	return cloned
 }
 
+// applyUserDelta folds a delta into a full user list. The result is never
+// nil: removing the last user leaves an empty list, which still means "no
+// users" to the service, while nil means "no user state".
 func applyUserDelta(users *[]model.UserSpec, action string, delta []model.UserSpec) bool {
-	current := cloneUsers(*users)
+	current := cloneUserState(*users)
 	index := make(map[int]int, len(current))
 	for i, user := range current {
 		index[user.ID] = i
@@ -251,7 +307,7 @@ func applyUserDelta(users *[]model.UserSpec, action string, delta []model.UserSp
 			}
 			filtered = append(filtered, user)
 		}
-		current = append([]model.UserSpec(nil), filtered...)
+		current = append(make([]model.UserSpec, 0, len(filtered)), filtered...)
 	default:
 		return false
 	}
