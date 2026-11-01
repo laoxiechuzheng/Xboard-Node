@@ -59,6 +59,12 @@ type SingBox struct {
 	// Survives Reload (hot-swap) since live connections persist.
 	connTracker *ConnTracker
 
+	// draining holds the trackers of replaced boxes that still carry live
+	// connections until recycleOldBox hard-closes them. Every later revoke
+	// must reach them too, or a user revoked after a restart keeps using the
+	// old box for up to drainTimeout.
+	draining map[*ConnTracker]struct{}
+
 	// speedLimitFunc resolves a user UUID to a *rate.Limiter.
 	// Set once by SetSpeedLimitFunc and forwarded to every new ConnTracker.
 	speedLimitFunc func(string) *rate.Limiter
@@ -175,14 +181,23 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	go tracker.runIdleJanitor(ctx)
 
 	// Recycle old instance in background — drain then close. The old box
-	// keeps serving live connections while it drains: give its tracker the
-	// new user set first, so users this restart removed (or re-keyed) are
-	// cut now and their new streams refused, while kept users drain.
+	// keeps serving live connections while it drains: narrow its tracker to
+	// the new user set first, so users this restart removed (or re-keyed) are
+	// cut now and their new streams refused, while kept users drain. It stays
+	// in s.draining until recycled so later revokes reach it as well.
 	if oldBox != nil {
 		if oldTracker != nil {
-			oldTracker.SetUserMap(buildUserMap(users))
+			if s.draining == nil {
+				s.draining = make(map[*ConnTracker]struct{})
+			}
+			s.draining[oldTracker] = struct{}{}
 		}
-		go recycleOldBox(oldBox, oldCancel, oldCtx, oldTracker)
+		s.restrictDrainingLocked(buildUserMap(users))
+		go recycleOldBox(oldBox, oldCancel, oldCtx, oldTracker, func() {
+			s.mu.Lock()
+			delete(s.draining, oldTracker)
+			s.mu.Unlock()
+		})
 	}
 
 	nlog.Core().Debug("sing-box started", "users", len(users))
@@ -207,8 +222,9 @@ func idleTimeoutFromConfig(cfg config.KernelConfig) time.Duration {
 
 // recycleOldBox gracefully shuts down a previous sing-box instance in the
 // background. It closes listen sockets first, waits for connections to drain,
-// then hard-closes. This avoids blocking the new instance's startup.
-func recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, oldCtx context.Context, oldTracker *ConnTracker) {
+// then hard-closes. This avoids blocking the new instance's startup. done runs
+// once the old box can no longer carry traffic.
+func recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, oldCtx context.Context, oldTracker *ConnTracker, done func()) {
 	// Step 1: close listen sockets so no new connections arrive on old ports.
 	if im := service.FromContext[adapter.InboundManager](oldCtx); im != nil {
 		_ = im.Close()
@@ -229,6 +245,9 @@ func recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, oldCtx context
 	oldBox.Close()
 	if oldCancel != nil {
 		oldCancel()
+	}
+	if done != nil {
+		done()
 	}
 	nlog.Core().Debug("sing-box: old instance recycled")
 }
@@ -287,8 +306,8 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 	// Only update the user map — do NOT re-register or traffic is double-counted.
 	// Publish it before the inbounds change: the tracker refuses users that are
 	// not in the map yet, and closes connections of users no longer in it.
+	s.publishUserMapLocked(users)
 	if s.connTracker != nil {
-		s.connTracker.SetUserMap(buildUserMap(users))
 		s.connTracker.SetAuditSink(s.cfg.AuditSink, nodeConfig.NodeID, inboundProtocol(nodeConfig))
 	}
 
@@ -557,8 +576,8 @@ func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err e
 
 	if added == 0 && removed == 0 {
 		// Only limits may have changed — update tracker map.
+		s.publishUserMapLocked(users)
 		if s.connTracker != nil {
-			s.connTracker.SetUserMap(buildUserMap(users))
 			s.connTracker.SetAuditSink(s.cfg.AuditSink, s.nodeConfig.NodeID, inboundProtocol(s.nodeConfig))
 		}
 		s.users = users
@@ -570,6 +589,26 @@ func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err e
 	}
 	s.users = users
 	return
+}
+
+// publishUserMapLocked hands the user map to the current tracker and narrows
+// the draining ones to it. Must be called with s.mu held.
+func (s *SingBox) publishUserMapLocked(users []model.UserSpec) {
+	m := buildUserMap(users)
+	if s.connTracker != nil {
+		s.connTracker.SetUserMap(m)
+	}
+	s.restrictDrainingLocked(m)
+}
+
+// restrictDrainingLocked narrows every draining tracker to m. Their maps only
+// shrink: a draining box still holds the old credentials, so a user re-added
+// (or a UUID moved to another user) after the restart must not regain it.
+// Must be called with s.mu held.
+func (s *SingBox) restrictDrainingLocked(m map[string]int) {
+	for tracker := range s.draining {
+		tracker.RestrictUserMap(m)
+	}
 }
 
 // reloadInboundsLocked hot-swaps inbound users using UpdatableInbound.
@@ -602,8 +641,8 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 	// connections of users missing from it, so a just-added user must be in
 	// the map before an inbound can authenticate it. Removed users (and old
 	// UUIDs of reset users) have their live connections closed right here.
+	s.publishUserMapLocked(users)
 	if s.connTracker != nil {
-		s.connTracker.SetUserMap(buildUserMap(users))
 		s.connTracker.SetAuditSink(s.cfg.AuditSink, s.nodeConfig.NodeID, inboundProtocol(s.nodeConfig))
 	}
 
@@ -697,13 +736,34 @@ func (s *SingBox) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, a
 	return traffic, aliveIPs, connCount, nil
 }
 
+// trackersSafe returns the current tracker and the draining ones: a forced
+// close must also reach connections still alive on a replaced box.
+func (s *SingBox) trackersSafe() []*ConnTracker {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	trackers := make([]*ConnTracker, 0, 1+len(s.draining))
+	if s.connTracker != nil {
+		trackers = append(trackers, s.connTracker)
+	}
+	for tracker := range s.draining {
+		trackers = append(trackers, tracker)
+	}
+	return trackers
+}
+
 // CloseConnection force-closes a specific connection by its ID.
 func (s *SingBox) CloseConnection(_ context.Context, connID string) error {
-	ct := s.connTrackerSafe()
-	if ct == nil {
+	trackers := s.trackersSafe()
+	if len(trackers) == 0 {
 		return fmt.Errorf("not running")
 	}
-	if !ct.CloseByID(connID) {
+	found := false
+	for _, ct := range trackers {
+		if ct.CloseByID(connID) {
+			found = true
+		}
+	}
+	if !found {
 		nlog.Core().Debug("CloseConnection: connection not found (already closed?)", "id", connID)
 	}
 	return nil
@@ -713,11 +773,9 @@ func (s *SingBox) CloseConnection(_ context.Context, connID string) error {
 // with a user UUID. User removal already does this; this is for callers that
 // need to cut a user that stays registered.
 func (s *SingBox) CloseUserConnections(_ context.Context, uuid string) error {
-	ct := s.connTrackerSafe()
-	if ct == nil {
-		return nil
+	for _, ct := range s.trackersSafe() {
+		ct.CloseByUUID(uuid)
 	}
-	ct.CloseByUUID(uuid)
 	return nil
 }
 

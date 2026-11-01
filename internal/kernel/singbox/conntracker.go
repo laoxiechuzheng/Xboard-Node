@@ -140,7 +140,6 @@ type ConnTracker struct {
 	// ever changed owner is recorded as 0 and refused on HY2/TUIC, whose
 	// sessions authenticate by slot (see resolveUserLocked).
 	uuidOwners map[string]int
-	idCounter  atomic.Int64
 
 	// idleTimeout is the sing-box equivalent of xray's connIdle. A TCP
 	// connection with no read/write activity for this long is closed by the
@@ -221,6 +220,32 @@ func (t *ConnTracker) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
 // authenticates against the not-yet-updated inbound is refused here.
 func (t *ConnTracker) SetUserMap(m map[string]int) {
 	t.usersMu.Lock()
+	revoked := t.setUserMapLocked(m)
+	t.usersMu.Unlock()
+	kickRevoked(revoked)
+}
+
+// RestrictUserMap narrows the user map to the entries whose UUID still maps
+// to the same user in next, closing the connections of every dropped entry
+// like SetUserMap. It never adds a UUID or moves one to another user: a
+// draining box must lose revoked credentials but never regain one, since its
+// inbounds still hold the credential set from before the restart.
+func (t *ConnTracker) RestrictUserMap(next map[string]int) {
+	t.usersMu.Lock()
+	kept := make(map[string]int, len(t.uuidMap))
+	for uuid, uid := range t.uuidMap {
+		if next[uuid] == uid {
+			kept[uuid] = uid
+		}
+	}
+	revoked := t.setUserMapLocked(kept)
+	t.usersMu.Unlock()
+	kickRevoked(revoked)
+}
+
+// setUserMapLocked installs m and unindexes the connections it revokes; the
+// caller kicks them after releasing usersMu.
+func (t *ConnTracker) setUserMapLocked(m map[string]int) []userConn {
 	t.uuidMap = make(map[string]int, len(m))
 	t.idUUID = make(map[int]string, len(m))
 	for uuid, uid := range m {
@@ -252,7 +277,10 @@ func (t *ConnTracker) SetUserMap(m map[string]int) {
 			delete(t.userConns, uuid)
 		}
 	}
-	t.usersMu.Unlock()
+	return revoked
+}
+
+func kickRevoked(revoked []userConn) {
 	if len(revoked) > 0 {
 		nlog.Core().Info("singbox: closing connections of removed users", "connections", len(revoked))
 		kickAll(revoked)
@@ -294,15 +322,24 @@ func (t *ConnTracker) resolveUserLocked(metadata adapter.InboundContext) (uuid s
 	return uuid, uid, t.users[uid]
 }
 
+// authenticatingInbounds are the inbound types that always name the
+// authenticated user, so a connection without one is never a panel user. On
+// HY2 and TUIC it is a retired slot. socks, http, mixed and naive stop
+// authenticating once their user list is empty (sing's auth.NewAuthenticator
+// returns nil), so there it is an anonymous client of an open proxy.
+var authenticatingInbounds = map[string]bool{
+	"hysteria2": true, "tuic": true, "socks": true, "http": true, "mixed": true, "naive": true,
+}
+
 // refusesUnknown reports whether a connection must be refused because its
-// authenticated user is not (or no longer) a current user. Inbounds that do
-// not authenticate users leave metadata.User empty and are served as before;
-// HY2 and TUIC always authenticate, so an empty user there is a retired slot.
+// authenticated user is not (or no longer) a current user. Other inbound
+// types may route connections with an empty metadata.User; those are served
+// as before, since an empty user list does not open those protocols up.
 func refusesUnknown(metadata adapter.InboundContext, us *userStats) bool {
 	if us != nil {
 		return false
 	}
-	return metadata.User != "" || metadata.InboundType == "hysteria2" || metadata.InboundType == "tuic"
+	return metadata.User != "" || authenticatingInbounds[metadata.InboundType]
 }
 
 // registerLocked indexes a live connection under its UUID. It fails when the
@@ -596,8 +633,12 @@ func (t *ConnTracker) checkDeviceGate(us *userStats, userID int, sourceIP string
 	return true
 }
 
+// connIDCounter is process-wide so connection IDs stay unique across the
+// current tracker and the draining ones: CloseConnection asks all of them.
+var connIDCounter atomic.Int64
+
 func (t *ConnTracker) nextID() string {
-	return "sb-" + formatInt36(t.idCounter.Add(1))
+	return "sb-" + formatInt36(connIDCounter.Add(1))
 }
 
 func formatInt36(n int64) string {

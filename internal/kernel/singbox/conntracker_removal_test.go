@@ -145,8 +145,28 @@ func TestConnTrackerRefusesUnknownUserOnEveryAuthenticatingInbound(t *testing.T)
 	}
 }
 
-// Inbounds without user authentication leave metadata.User empty; they must
-// keep working exactly as before.
+// socks, http, mixed and naive stop authenticating once their user list is
+// empty, and HY2/TUIC always name the user: a connection without a user on
+// any of them is anonymous and must not be proxied (TCP or SOCKS UDP).
+func TestConnTrackerRefusesEmptyUserOnAuthenticatingInbounds(t *testing.T) {
+	tracker := NewConnTracker(0)
+	tracker.SetUserMap(map[string]int{"known": 42})
+	for _, inboundType := range []string{"socks", "http", "mixed", "naive", "hysteria2", "tuic"} {
+		tcp := &closeFlagConn{}
+		udp := &closeFlagPacketConn{}
+		tracker.RoutedConnection(context.Background(), tcp, removalMetadata(inboundType, ""), nil, nil)
+		tracker.RoutedPacketConnection(context.Background(), udp, removalMetadata(inboundType, ""), nil, nil)
+		if !tcp.closed.Load() || !udp.closed.Load() {
+			t.Fatalf("%s: connection without a user was served (tcp closed=%v, udp closed=%v)", inboundType, tcp.closed.Load(), udp.closed.Load())
+		}
+	}
+	if _, _, count := tracker.GetUserTraffic(); count != 0 {
+		t.Fatalf("refused connections were counted: %d", count)
+	}
+}
+
+// The remaining inbound types may route connections without a user; only
+// the authenticating inbounds above refuse them.
 func TestConnTrackerServesConnectionsWithoutUser(t *testing.T) {
 	tracker := NewConnTracker(0)
 	tracker.SetUserMap(map[string]int{"known": 42})
@@ -422,4 +442,38 @@ func TestConnTrackerConcurrentRoutingAndRemoval(t *testing.T) {
 			t.Fatal("a connection of the removed user is still indexed")
 		}
 	}
+}
+
+// A draining tracker only loses users: RestrictUserMap drops removed users
+// and UUIDs that moved to another user, and never adds a UUID.
+func TestConnTrackerRestrictUserMapOnlyShrinks(t *testing.T) {
+	tracker := NewConnTracker(0)
+	tracker.SetUserMap(map[string]int{"kept": 1, "removed": 2, "moved": 3})
+	kept := &closeFlagConn{}
+	removed := &closeFlagConn{}
+	moved := &closeFlagConn{}
+	tracker.RoutedConnection(context.Background(), kept, removalMetadata("anytls", "kept"), nil, nil)
+	tracker.RoutedConnection(context.Background(), removed, removalMetadata("anytls", "removed"), nil, nil)
+	tracker.RoutedConnection(context.Background(), moved, removalMetadata("anytls", "moved"), nil, nil)
+
+	tracker.RestrictUserMap(map[string]int{"kept": 1, "moved": 4, "added": 5})
+	waitClosed(t, "removed user's connection", removed.closed.Load)
+	waitClosed(t, "moved UUID's connection", moved.closed.Load)
+	stayOpen(t, "kept user's connection", kept.closed.Load)
+	for _, uuid := range []string{"removed", "moved", "added"} {
+		conn := &closeFlagConn{}
+		tracker.RoutedConnection(context.Background(), conn, removalMetadata("anytls", uuid), nil, nil)
+		if !conn.closed.Load() {
+			t.Fatalf("restricted tracker served %q", uuid)
+		}
+	}
+
+	// Re-adding the removed user later must not re-admit it either.
+	tracker.RestrictUserMap(map[string]int{"kept": 1, "removed": 2})
+	again := &closeFlagConn{}
+	tracker.RoutedConnection(context.Background(), again, removalMetadata("anytls", "removed"), nil, nil)
+	if !again.closed.Load() {
+		t.Fatal("restricted tracker re-admitted a user re-added after the restriction")
+	}
+	stayOpen(t, "kept user's connection", kept.closed.Load)
 }
