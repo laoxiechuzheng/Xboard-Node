@@ -15,6 +15,12 @@ type MailboxState struct {
 	HasUsers       bool
 	HasDevices     bool
 	NeedsReconcile bool
+	// TouchedUserIDs lists the users named by the deltas folded into Users
+	// since the last drain; TouchedAllUsers means a full snapshot was among
+	// them. The service uses them to tell which pulled users may be older
+	// than these events.
+	TouchedUserIDs  []int
+	TouchedAllUsers bool
 }
 
 // NodeMailbox buffers WS events for a machine-mode node service that is not
@@ -33,10 +39,26 @@ type NodeMailbox struct {
 	hasFullUserState bool
 	// pendingFullUsers is set while users holds an undrained WS full snapshot.
 	pendingFullUsers bool
+	// userGen counts received user events (full snapshots and deltas);
+	// fullUsersGen is the generation of the undrained full snapshot. A pull
+	// records userGen when it starts, so ReplaceBaseline can tell events the
+	// pulled list already reflects from events received during the pull.
+	userGen      uint64
+	fullUsersGen uint64
 	// pendingDeltas are the user deltas folded into users since the last
 	// drain or full snapshot, kept so ReplaceBaseline can replay them.
-	pendingDeltas []Event
-	notifyCh      chan struct{}
+	pendingDeltas []pendingDelta
+	// touchedUserIDs and touchedAllUsers collect what the undrained user
+	// events named, for MailboxState.
+	touchedUserIDs  map[int]struct{}
+	touchedAllUsers bool
+	notifyCh        chan struct{}
+}
+
+type pendingDelta struct {
+	gen    uint64
+	action string
+	users  []model.UserSpec
 }
 
 func NewNodeMailbox() *NodeMailbox {
@@ -65,32 +87,64 @@ func (m *NodeMailbox) SeedBaseline(users []model.UserSpec, config *model.NodeSpe
 	}
 }
 
+// UserGeneration returns the number of user events received so far. A pull
+// records it before reading the panel and passes it to ReplaceBaseline.
+func (m *NodeMailbox) UserGeneration() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.userGen
+}
+
 // ReplaceBaseline installs the user list the service just applied from a REST
-// pull. Deltas are folded into the mailbox's own list and drained as a full
-// snapshot, so without this REST-only changes (expiry, a missed push) would be
-// undone by the next delta. Deltas received but not yet drained are replayed
-// on top of the new baseline, and an undrained WS full snapshot is kept as is.
-func (m *NodeMailbox) ReplaceBaseline(users []model.UserSpec) {
+// pull that started at user generation since. Deltas are folded into the
+// mailbox's own list and drained as a full snapshot, so without this
+// REST-only changes (expiry, a missed push) would be undone by the next
+// delta.
+//
+// Undrained events received before the pull started are older than the
+// pulled list and are dropped; when only those were pending, nothing is left
+// to drain. Undrained events received during the pull may
+// be newer, so deltas among them are replayed on top of the new baseline and
+// a full snapshot among them is kept as is. Either way the next drain may
+// differ from the pulled list, so ReplaceBaseline then returns true and the
+// caller re-pulls to settle it.
+func (m *NodeMailbox) ReplaceBaseline(users []model.UserSpec, since uint64) bool {
 	if users == nil {
-		return
+		return false
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.pendingFullUsers {
-		// The undrained WS snapshot wins even when this REST list is newer.
-		// For a change the panel never pushes (expiry, traffic exhaustion),
-		// the next drain therefore briefly reinstates a user this pull just
-		// removed, until the following pull removes it again. The window is
-		// short because the drain runs on the same service loop; telling the
-		// two apart would need a generation shared with the WS mux.
-		return
+	if m.pendingFullUsers && m.fullUsersGen > since {
+		return true
 	}
-	baseline := cloneUsers(users)
+	baseline := cloneUserState(users)
+	kept := m.pendingDeltas[:0]
+	// Only the kept deltas still count as touching users; the service already
+	// applied the pulled list, which supersedes the dropped events.
+	m.touchedUserIDs = nil
+	m.touchedAllUsers = false
 	for _, delta := range m.pendingDeltas {
-		applyUserDelta(&baseline, delta.DeltaAction, delta.DeltaUsers)
+		if delta.gen <= since {
+			continue
+		}
+		applyUserDelta(&baseline, delta.action, delta.users)
+		kept = append(kept, delta)
+		if m.touchedUserIDs == nil {
+			m.touchedUserIDs = make(map[int]struct{}, len(delta.users))
+		}
+		for _, user := range delta.users {
+			m.touchedUserIDs[user.ID] = struct{}{}
+		}
 	}
+	m.pendingDeltas = kept
+	m.pendingFullUsers = false
 	m.users = baseline
 	m.hasFullUserState = true
+	if len(kept) == 0 {
+		// The service already applied this list: nothing left to drain.
+		m.dirtyUsers = false
+	}
+	return len(kept) > 0
 }
 
 func (m *NodeMailbox) Apply(event Event) {
@@ -106,11 +160,14 @@ func (m *NodeMailbox) Apply(event Event) {
 		}
 	case EventSyncUsers:
 		if event.Users != nil {
+			m.userGen++
 			m.users = cloneUsers(event.Users)
 			m.dirtyUsers = true
 			m.hasFullUserState = true
 			m.pendingFullUsers = true
+			m.fullUsersGen = m.userGen
 			m.pendingDeltas = nil
+			m.touchedAllUsers = true
 			changed = true
 		}
 	case EventSyncDevices:
@@ -121,6 +178,7 @@ func (m *NodeMailbox) Apply(event Event) {
 		}
 	case EventSyncUserDelta:
 		if len(event.DeltaUsers) > 0 {
+			m.userGen++
 			if !m.hasFullUserState {
 				m.needsReconcile = true
 				changed = true
@@ -128,11 +186,17 @@ func (m *NodeMailbox) Apply(event Event) {
 				m.needsReconcile = true
 				changed = true
 			} else {
-				m.pendingDeltas = append(m.pendingDeltas, Event{
-					Type:        EventSyncUserDelta,
-					DeltaAction: event.DeltaAction,
-					DeltaUsers:  cloneUsers(event.DeltaUsers),
+				m.pendingDeltas = append(m.pendingDeltas, pendingDelta{
+					gen:    m.userGen,
+					action: event.DeltaAction,
+					users:  cloneUsers(event.DeltaUsers),
 				})
+				if m.touchedUserIDs == nil {
+					m.touchedUserIDs = make(map[int]struct{}, len(event.DeltaUsers))
+				}
+				for _, user := range event.DeltaUsers {
+					m.touchedUserIDs[user.ID] = struct{}{}
+				}
 				m.dirtyUsers = true
 				changed = true
 			}
@@ -171,9 +235,15 @@ func (m *NodeMailbox) DrainIfReady() MailboxState {
 		// and must stay non-nil, because the service ignores a nil list.
 		state.Users = cloneUserState(m.users)
 		state.HasUsers = true
+		state.TouchedAllUsers = m.touchedAllUsers
+		for id := range m.touchedUserIDs {
+			state.TouchedUserIDs = append(state.TouchedUserIDs, id)
+		}
 		m.dirtyUsers = false
 		m.pendingFullUsers = false
 		m.pendingDeltas = nil
+		m.touchedUserIDs = nil
+		m.touchedAllUsers = false
 	}
 	if m.dirtyDevices && m.deviceUsers != nil {
 		state.DeviceUsers = cloneDeviceUsers(m.deviceUsers)

@@ -77,12 +77,21 @@ type Service struct {
 	pullResults chan pullResult
 	// userEventSeq counts pushed user events (sync.users, sync.user.delta)
 	// handled by the event loop. A pull records it before polling; if it moved
-	// by the time the result is applied, the pulled users may predate state
-	// those events already applied, so they are discarded and re-pulled.
+	// by the time the result is applied, the pulled entries of the users those
+	// events touched may predate them, so mergePulledUsers keeps the local
+	// entries for those users.
 	userEventSeq atomic.Uint64
-	// configEventSeq counts pushed configs (sync.config) applied by the event
-	// loop. A pulled config read before one of them is older than the config
-	// now running, so it is discarded instead of rolling the kernel back.
+	// userEventMarks records which users each pushed user event touched, for
+	// mergePulledUsers (main goroutine only). Marks a finished pull no longer
+	// needs are trimmed; past maxUserEventMarks the oldest are dropped and
+	// userEventMarksFloor rises to the newest dropped seq, so a pull that
+	// started before it treats every user as touched.
+	userEventMarks      []userEventMark
+	userEventMarksFloor uint64
+	// configEventSeq counts pushed configs (sync.config) received by the event
+	// loop, applied or equal to the running one. A pulled config read before
+	// one of them is older than the config now running, so it is discarded
+	// instead of rolling the kernel back.
 	configEventSeq atomic.Uint64
 	// stalePullDiscards counts consecutive pull results that carried stale
 	// data (main goroutine only). Each one schedules a jittered re-pull, up to
@@ -115,10 +124,22 @@ type pullResult struct {
 	configHash string
 	userHash   string
 	// userEventSeq and configEventSeq are the Service counters when the pull
-	// started.
+	// started; mailboxGen is the machine mailbox's user generation then.
 	userEventSeq   uint64
 	configEventSeq uint64
+	mailboxGen     uint64
 }
+
+// userEventMark records the users one pushed user event touched; all marks a
+// full list (sync.users), which touches every user.
+type userEventMark struct {
+	seq uint64
+	ids []int
+	all bool
+}
+
+// maxUserEventMarks bounds userEventMarks while no pull completes.
+const maxUserEventMarks = 4096
 
 // apiBackoff skips the next periodic attempt after a failed one. Attempts
 // only run when no skip is pending, so consecutive failures never widen the
@@ -485,7 +506,10 @@ func (s *Service) drainMachineMailbox(ctx context.Context) {
 		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncConfig, Config: state.Config})
 	}
 	if state.HasUsers {
-		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncUsers, Users: state.Users})
+		// The drained list is a full list, but only the users the drained
+		// events named count as touched by a push.
+		s.noteUserEvent(state.TouchedUserIDs, state.TouchedAllUsers)
+		s.applyPushedUsers(ctx, state.Users)
 	}
 	if state.HasDevices {
 		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncDevices, DeviceUsers: state.DeviceUsers})
@@ -669,6 +693,9 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		}
 		newConfigHash := computeConfigHash(event.Config)
 		if newConfigHash == s.lastConfigHash {
+			// Nothing to apply, but the panel has this config now: a pull in
+			// flight may have read a config the panel has since reverted.
+			s.configEventSeq.Add(1)
 			return
 		}
 		if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), event.Config, s.cert.TLSCert()); err != nil {
@@ -697,22 +724,18 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		if event.Users == nil {
 			return
 		}
-		s.userEventSeq.Add(1)
-		newHash := computeUserHash(event.Users)
-		if newHash == s.lastUserHash {
-			return
-		}
-		s.invalidateUserCache()
-		if s.nodeLog != nil {
-			s.nodeLog.Info(fmt.Sprintf("users updated, %d users", len(event.Users)))
-		}
-		s.applyUserUpdate(ctx, event.Users, newHash)
+		s.noteUserEvent(nil, true)
+		s.applyPushedUsers(ctx, event.Users)
 
 	case controlplane.EventSyncUserDelta:
 		if len(event.DeltaUsers) == 0 {
 			return
 		}
-		s.userEventSeq.Add(1)
+		ids := make([]int, len(event.DeltaUsers))
+		for i, user := range event.DeltaUsers {
+			ids[i] = user.ID
+		}
+		s.noteUserEvent(ids, false)
 		if s.nodeLog != nil {
 			s.nodeLog.Info(fmt.Sprintf("users delta: %s, %d users", event.DeltaAction, len(event.DeltaUsers)))
 		}
@@ -733,6 +756,111 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 	}
 }
 
+// applyPushedUsers applies a pushed full user list.
+func (s *Service) applyPushedUsers(ctx context.Context, users []model.UserSpec) {
+	newHash := computeUserHash(users)
+	if newHash == s.lastUserHash {
+		return
+	}
+	s.invalidateUserCache()
+	if s.nodeLog != nil {
+		s.nodeLog.Info(fmt.Sprintf("users updated, %d users", len(users)))
+	}
+	s.applyUserUpdate(ctx, users, newHash)
+}
+
+// noteUserEvent counts a pushed user event and, when pulls run, records the
+// users it touched (all for a full list) for mergePulledUsers.
+func (s *Service) noteUserEvent(ids []int, all bool) {
+	seq := s.userEventSeq.Add(1)
+	if s.source == nil || !s.source.SupportsPolling() {
+		return
+	}
+	s.userEventMarks = append(s.userEventMarks, userEventMark{seq: seq, ids: ids, all: all})
+	if over := len(s.userEventMarks) - maxUserEventMarks; over > 0 {
+		s.userEventMarksFloor = s.userEventMarks[over-1].seq
+		s.userEventMarks = append([]userEventMark(nil), s.userEventMarks[over:]...)
+	}
+}
+
+// trimUserEventMarks drops the marks a pull that started at seq no longer
+// needs. Pulls never overlap, so later pulls start at seq or after.
+func (s *Service) trimUserEventMarks(seq uint64) {
+	i := 0
+	for i < len(s.userEventMarks) && s.userEventMarks[i].seq <= seq {
+		i++
+	}
+	if i > 0 {
+		s.userEventMarks = append([]userEventMark(nil), s.userEventMarks[i:]...)
+	}
+}
+
+// mergePulledUsers reconciles a pulled user list with the pushed user events
+// handled since the pull started at seq since. The pulled entry of a user
+// those events touched may predate them, so the local entry wins for that
+// user; every other user takes the pulled entry, which was read after all
+// earlier events. A user whose push was lost is therefore repaired by the
+// first pull during which no event touches that user, however busy the
+// other users are, and an event that does touch it carries its newer state
+// anyway.
+//
+// conflict reports that the pulled and local entries of a touched user
+// differ: the panel may have changed that user again during the pull, so the
+// caller drops the ETag and re-pulls. A full list (sync.users) touches every
+// user, as does a pull older than the retained marks; the pulled list is
+// then dropped unless it equals the local one.
+func (s *Service) mergePulledUsers(pulled []model.UserSpec, since uint64) (merged []model.UserSpec, conflict bool) {
+	touched := make(map[int]struct{})
+	all := since < s.userEventMarksFloor
+	for _, mark := range s.userEventMarks {
+		if all {
+			break
+		}
+		if mark.seq <= since {
+			continue
+		}
+		if mark.all {
+			all = true
+			break
+		}
+		for _, id := range mark.ids {
+			touched[id] = struct{}{}
+		}
+	}
+	if all {
+		if computeUserHash(pulled) == s.lastUserHash {
+			return pulled, false
+		}
+		return nil, true
+	}
+
+	local := make(map[int]model.UserSpec, len(touched))
+	for _, user := range s.lastUsers {
+		if _, ok := touched[user.ID]; ok {
+			local[user.ID] = user
+		}
+	}
+	merged = make([]model.UserSpec, 0, len(pulled)+len(local))
+	pulledTouched := 0
+	for _, user := range pulled {
+		if _, ok := touched[user.ID]; !ok {
+			merged = append(merged, user)
+			continue
+		}
+		pulledTouched++
+		if mine, ok := local[user.ID]; !ok || mine != user {
+			conflict = true
+		}
+	}
+	if pulledTouched != len(local) {
+		conflict = true
+	}
+	for _, user := range local {
+		merged = append(merged, user)
+	}
+	return merged, conflict
+}
+
 // invalidateUserCache drops the users ETag so the next pull returns the full
 // list. It runs when pulled users are not applied, and after a pushed user
 // event changed local users: they may then differ from the last REST
@@ -741,8 +869,8 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 // event that changes nothing keeps the ETag, so the full sync.users the
 // panel sends on every WS reconnect does not turn the reconnect pull into a
 // full download. Pulls already in flight are covered separately: every
-// pushed user event bumps userEventSeq, and applyPullResult discards their
-// users.
+// pushed user event is recorded in userEventMarks, and applyPullResult keeps
+// the local entries of the users it touched.
 func (s *Service) invalidateUserCache() {
 	if s.source != nil {
 		s.source.InvalidateUserCache()
@@ -773,16 +901,17 @@ func (s *Service) certRenewed() bool {
 // return full data.
 const maxStalePullRepulls = 3
 
-// repullAfterStale schedules a jittered resync after applyPullResult dropped
-// stale data from a pull result.
+// repullAfterStale schedules a jittered resync after applyPullResult could
+// not apply all of a pull result: a config or users read before pushed
+// events, or users the kernel rejected.
 func (s *Service) repullAfterStale(ctx context.Context, staleConfig, staleUsers bool) {
 	s.stalePullDiscards++
 	if s.stalePullDiscards > maxStalePullRepulls {
-		nlog.Core().Warn("discarded stale pull data again, leaving reconciliation to the periodic pull",
+		nlog.Core().Warn("pull result not fully applied again, leaving reconciliation to the periodic pull",
 			"stale_config", staleConfig, "stale_users", staleUsers, "discards", s.stalePullDiscards)
 		return
 	}
-	nlog.Core().Info("discarded stale pull data, re-pulling",
+	nlog.Core().Info("pull result not fully applied, re-pulling",
 		"stale_config", staleConfig, "stale_users", staleUsers, "discards", s.stalePullDiscards)
 	s.scheduleResyncAsync(ctx, s.stalePullJitter)
 }
@@ -826,6 +955,15 @@ func (s *Service) startPull(ctx context.Context, resync bool) {
 	s.pullActive = true
 	s.pullMu.Unlock()
 
+	// The mailbox generation is read first: a drain between the two reads
+	// then counts as before the pull (its events are older than the panel
+	// read), while a mailbox event received after the generation is either
+	// still undrained, and replayed by ReplaceBaseline, or drained after
+	// userSeq and marked.
+	var mailboxGen uint64
+	if s.machineMailbox != nil {
+		mailboxGen = s.machineMailbox.UserGeneration()
+	}
 	userSeq := s.userEventSeq.Load()
 	configSeq := s.configEventSeq.Load()
 
@@ -844,7 +982,7 @@ func (s *Service) startPull(ctx context.Context, resync bool) {
 			nlog.Core().Error("control plane config rejected, keeping the running config", "error", snapshot.ConfigErr)
 		}
 
-		result := pullResult{userEventSeq: userSeq, configEventSeq: configSeq}
+		result := pullResult{userEventSeq: userSeq, configEventSeq: configSeq, mailboxGen: mailboxGen}
 		if snapshot.Config != nil {
 			result.config = snapshot.Config
 			result.configHash = computeConfigHash(snapshot.Config)
@@ -900,20 +1038,17 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 		result.config = nil
 	}
 
-	staleUsers := result.users != nil && result.userEventSeq != s.userEventSeq.Load()
-	if staleUsers {
-		// WS user events were applied after this pull read the panel, so the
-		// pulled list may predate them: applying it could restore a removed
-		// user or roll back a uuid reset. Drop the users and their ETag.
-		result.users = nil
-		s.invalidateUserCache()
+	staleUsers := false
+	if result.users != nil && result.userEventSeq != s.userEventSeq.Load() {
+		// WS user events were applied while this pull was in flight, so the
+		// pulled entries of the users they touched may predate them: applying
+		// those could restore a removed user or roll back a uuid reset.
+		result.users, staleUsers = s.mergePulledUsers(result.users, result.userEventSeq)
+		if result.users != nil {
+			result.userHash = computeUserHash(result.users)
+		}
 	}
-
-	if staleConfig || staleUsers {
-		s.repullAfterStale(ctx, staleConfig, staleUsers)
-	} else {
-		s.stalePullDiscards = 0
-	}
+	s.trimUserEventMarks(result.userEventSeq)
 
 	if certChanged {
 		nlog.Core().Info("certificate renewed, kernel restart needed")
@@ -956,8 +1091,26 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 			// as a full snapshot, so it must start from the panel's current
 			// list; a stale baseline would undo REST-only changes on the next
 			// delta.
-			s.machineMailbox.ReplaceBaseline(result.users)
+			if s.machineMailbox.ReplaceBaseline(result.users, result.mailboxGen) {
+				staleUsers = true
+			}
 		}
+		if s.lastUserHash != result.userHash {
+			// The kernel rejected the list and the old users were restored:
+			// the ETag must not answer 304 for a list that never applied.
+			staleUsers = true
+		}
+	}
+
+	if staleUsers {
+		// The applied list differs from the pulled one (or will, once the
+		// mailbox drains), so the ETag must not answer 304 for it.
+		s.invalidateUserCache()
+	}
+	if staleConfig || staleUsers {
+		s.repullAfterStale(ctx, staleConfig, staleUsers)
+	} else {
+		s.stalePullDiscards = 0
 	}
 
 	if configChanged {
@@ -1204,6 +1357,14 @@ func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged 
 
 	if s.lastConfig == nil || len(s.lastUsers) == 0 {
 		if len(s.lastUsers) == 0 {
+			if s.kernel.IsRunning() {
+				// Stop drains gracefully, and a stopped xray instance keeps
+				// serving its links for minutes: revoke everyone first, as
+				// removing the last user does.
+				if _, _, err := s.kernel.UpdateUsers([]model.UserSpec{}); err != nil {
+					nlog.Core().Warn("revoking users before stopping the kernel failed", "error", err)
+				}
+			}
 			s.kernel.Stop()
 			s.appliedState.Users = nil
 		}

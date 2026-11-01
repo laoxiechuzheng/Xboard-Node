@@ -267,6 +267,10 @@ func TestWSClient_SyncUsersDistinguishesMissingAndEmpty(t *testing.T) {
 		{name: "missing", data: `{"node_id":17}`},
 		{name: "null", data: `{"node_id":17,"users":null}`},
 		{name: "empty", data: `{"node_id":17,"users":[]}`, wantEvent: true},
+		// Not the panel's contract: the weak decoder would turn these into a
+		// list that replaces (and so clears) every user.
+		{name: "empty-object", data: `{"node_id":17,"users":{}}`},
+		{name: "object", data: `{"node_id":17,"users":{"0":{"id":1,"uuid":"u1"}}}`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var received []WSEvent
@@ -297,6 +301,7 @@ func TestWSClient_UserDeltaWithoutUsersIsDropped(t *testing.T) {
 	}, nil, nil)
 	w.handleMessage(wsMessage{Event: WSEventSyncUserDelta, Data: json.RawMessage(`{"action":"remove","users":[]}`)})
 	w.handleMessage(wsMessage{Event: WSEventSyncUserDelta, Data: json.RawMessage(`{"action":"remove"}`)})
+	w.handleMessage(wsMessage{Event: WSEventSyncUserDelta, Data: json.RawMessage(`{"action":"remove","users":{"id":1,"uuid":"u1"}}`)})
 	if len(received) != 0 {
 		t.Fatalf("empty user deltas must be dropped, got %+v", received)
 	}

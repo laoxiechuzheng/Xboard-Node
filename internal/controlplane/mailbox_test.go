@@ -178,7 +178,9 @@ func TestNodeMailboxReplaceBaselineDropsRESTRemovedUsers(t *testing.T) {
 	mb.DrainIfReady()
 
 	// A REST pull removed user 2 (e.g. expiry, which pushes no delta).
-	mb.ReplaceBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}})
+	if mb.ReplaceBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}}, mb.UserGeneration()) {
+		t.Fatal("a baseline with no events received during the pull must not ask for a re-pull")
+	}
 	if state := mb.DrainIfReady(); state.HasUsers {
 		t.Fatalf("replacing the baseline alone must not emit users: %+v", state)
 	}
@@ -197,9 +199,13 @@ func TestNodeMailboxReplaceBaselineReplaysUndrainedDeltas(t *testing.T) {
 	mb.MarkReady()
 	mb.DrainIfReady()
 
+	// Both deltas arrive while the pull is in flight.
+	since := mb.UserGeneration()
 	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "add", DeltaUsers: []model.UserSpec{{ID: 3, UUID: "u3"}}})
 	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "remove", DeltaUsers: []model.UserSpec{{ID: 1}}})
-	mb.ReplaceBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 4, UUID: "u4"}})
+	if !mb.ReplaceBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 4, UUID: "u4"}}, since) {
+		t.Fatal("replaying deltas received during the pull must ask for a re-pull")
+	}
 
 	state := mb.DrainIfReady()
 	got := mailboxUserIDs(state.Users)
@@ -208,7 +214,7 @@ func TestNodeMailboxReplaceBaselineReplaysUndrainedDeltas(t *testing.T) {
 	}
 
 	// Drained deltas must not be replayed onto a later baseline.
-	mb.ReplaceBaseline([]model.UserSpec{{ID: 5, UUID: "u5"}})
+	mb.ReplaceBaseline([]model.UserSpec{{ID: 5, UUID: "u5"}}, since)
 	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "add", DeltaUsers: []model.UserSpec{{ID: 6, UUID: "u6"}}})
 	got = mailboxUserIDs(mb.DrainIfReady().Users)
 	if len(got) != 2 || got[5] != "u5" || got[6] != "u6" {
@@ -222,8 +228,11 @@ func TestNodeMailboxReplaceBaselineKeepsUndrainedFullSnapshot(t *testing.T) {
 	mb.MarkReady()
 	mb.DrainIfReady()
 
+	since := mb.UserGeneration()
 	mb.Apply(Event{Type: EventSyncUsers, Users: []model.UserSpec{{ID: 7, UUID: "u7"}}})
-	mb.ReplaceBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}})
+	if !mb.ReplaceBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}}, since) {
+		t.Fatal("keeping a full snapshot received during the pull must ask for a re-pull")
+	}
 
 	got := mailboxUserIDs(mb.DrainIfReady().Users)
 	if len(got) != 1 || got[7] != "u7" {
@@ -258,8 +267,9 @@ func TestNodeMailboxReplaceBaselineReplayRemovingLastUserDrainsEmptyList(t *test
 	mb.MarkReady()
 	mb.DrainIfReady()
 
+	since := mb.UserGeneration()
 	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "remove", DeltaUsers: []model.UserSpec{{ID: 1}}})
-	mb.ReplaceBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}})
+	mb.ReplaceBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}}, since)
 	state := mb.DrainIfReady()
 	if !state.HasUsers || state.Users == nil || len(state.Users) != 0 {
 		t.Fatalf("drained users = %#v (has=%v), want an empty non-nil list", state.Users, state.HasUsers)
@@ -273,5 +283,59 @@ func TestNodeMailboxEmptyFullSnapshotDrainsEmptyList(t *testing.T) {
 	state := mb.DrainIfReady()
 	if !state.HasUsers || state.Users == nil || len(state.Users) != 0 {
 		t.Fatalf("drained users = %#v (has=%v), want an empty non-nil list", state.Users, state.HasUsers)
+	}
+}
+
+// An undrained delta received before the pull started is older than the
+// pulled list: replaying it would undo a change the panel made afterwards
+// (here: user 1 restored, with the restoring push lost).
+func TestNodeMailboxReplaceBaselineDropsDeltasOlderThanThePull(t *testing.T) {
+	mb := NewNodeMailbox()
+	mb.SeedBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 2, UUID: "u2"}}, nil)
+	mb.MarkReady()
+	mb.DrainIfReady()
+
+	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "remove", DeltaUsers: []model.UserSpec{{ID: 1}}})
+	since := mb.UserGeneration()
+	if mb.ReplaceBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 2, UUID: "u2"}}, since) {
+		t.Fatal("dropping only older events must not ask for a re-pull")
+	}
+	if state := mb.DrainIfReady(); state.HasUsers {
+		t.Fatalf("the dropped delta must leave nothing to drain: %+v", state)
+	}
+
+	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "add", DeltaUsers: []model.UserSpec{{ID: 3, UUID: "u3"}}})
+	state := mb.DrainIfReady()
+	got := mailboxUserIDs(state.Users)
+	if !state.HasUsers || len(got) != 3 || got[1] != "u1" || got[2] != "u2" || got[3] != "u3" {
+		t.Fatalf("drained users = %+v, want the pulled list plus user 3", state.Users)
+	}
+	if len(state.TouchedUserIDs) != 1 || state.TouchedUserIDs[0] != 3 || state.TouchedAllUsers {
+		t.Fatalf("touched = %v all=%v, want user 3 only", state.TouchedUserIDs, state.TouchedAllUsers)
+	}
+}
+
+// Likewise an undrained full snapshot received before the pull started is
+// replaced by the newer pulled list.
+func TestNodeMailboxReplaceBaselineReplacesFullSnapshotOlderThanThePull(t *testing.T) {
+	mb := NewNodeMailbox()
+	mb.SeedBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}}, nil)
+	mb.MarkReady()
+	mb.DrainIfReady()
+
+	mb.Apply(Event{Type: EventSyncUsers, Users: []model.UserSpec{{ID: 7, UUID: "u7"}}})
+	since := mb.UserGeneration()
+	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "add", DeltaUsers: []model.UserSpec{{ID: 8, UUID: "u8"}}})
+	if !mb.ReplaceBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}}, since) {
+		t.Fatal("replaying a delta received during the pull must ask for a re-pull")
+	}
+	state := mb.DrainIfReady()
+	got := mailboxUserIDs(state.Users)
+	if len(got) != 2 || got[1] != "u1" || got[8] != "u8" {
+		t.Fatalf("drained users = %+v, want the pulled list plus the later delta (1, 8)", state.Users)
+	}
+	// The dropped snapshot no longer counts: only the replayed delta does.
+	if state.TouchedAllUsers || len(state.TouchedUserIDs) != 1 || state.TouchedUserIDs[0] != 8 {
+		t.Fatalf("touched = %v all=%v, want user 8 only", state.TouchedUserIDs, state.TouchedAllUsers)
 	}
 }

@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -424,6 +425,21 @@ func (w *WSClient) handleMessage(msg wsMessage) {
 	}
 }
 
+// usersFieldIsList reports whether a users payload's "users" value is a JSON
+// array, or missing/null (the decoders handle those). The weak decoder turns
+// an object into a list - {} into an empty one, which would clear every user
+// - so anything else is rejected before decoding.
+func usersFieldIsList(data []byte) bool {
+	var shape struct {
+		Users json.RawMessage `json:"users"`
+	}
+	if err := json.Unmarshal(data, &shape); err != nil {
+		return true // let the decoder report it
+	}
+	users := bytes.TrimSpace(shape.Users)
+	return len(users) == 0 || bytes.Equal(users, []byte("null")) || users[0] == '['
+}
+
 func (w *WSClient) handleDataEvent(msg wsMessage) {
 	var event WSEvent
 	event.Type = msg.Event
@@ -462,6 +478,10 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 
 	case WSEventSyncUsers:
 		nlog.Core().Debug("ws sync users event received")
+		if !usersFieldIsList(msg.Data) {
+			nlog.Core().Warn("ws: users payload is not a list")
+			return
+		}
 		var p syncUsersPayload
 		if err := decodeData(msg.Data, &p); err != nil {
 			nlog.Core().Warn("ws: cannot decode users payload", "error", err)
@@ -479,6 +499,10 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 
 	case WSEventSyncUserDelta:
 		nlog.Core().Debug("ws sync user delta event received")
+		if !usersFieldIsList(msg.Data) {
+			nlog.Core().Warn("ws: user delta payload is not a list")
+			return
+		}
 		var p syncUserDeltaPayload
 		if err := decodeData(msg.Data, &p); err != nil {
 			nlog.Core().Warn("ws: cannot decode user delta payload", "error", err)

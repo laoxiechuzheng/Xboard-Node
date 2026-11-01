@@ -563,12 +563,14 @@ func TestStalePullRepullsAreCapped(t *testing.T) {
 	k := &fakeKernel{running: true}
 	src := newBlockingPollSource()
 	s := newPollingTestService(k, src)
-	users := []model.UserSpec{{ID: 1, UUID: "u1"}}
-	s.updateUserState(users)
+	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "u1"}})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	s.userEventSeq.Add(1)
-	stale := pullResult{users: users, userHash: computeUserHash(users)}
+	// Every result started before a pushed event for user 1 and disagrees
+	// with it, so each one conflicts.
+	s.noteUserEvent([]int{1}, false)
+	pulled := []model.UserSpec{{ID: 1, UUID: "u1-old"}}
+	stale := pullResult{users: pulled, userHash: computeUserHash(pulled)}
 
 	serveRepull := func() {
 		t.Helper()
@@ -586,8 +588,242 @@ func TestStalePullRepullsAreCapped(t *testing.T) {
 
 	// A clean result resets the count.
 	s.applyPullResult(ctx, pullResult{userEventSeq: s.userEventSeq.Load()})
+	stale.userEventSeq = s.userEventSeq.Load()
+	s.noteUserEvent([]int{1}, false)
 	s.applyPullResult(ctx, stale)
 	serveRepull()
+	if got := usersByID(s.lastUsers); !mapsEqual(got, map[int]string{1: "u1"}) {
+		t.Fatalf("users = %v, want the pushed state of user 1 kept", got)
+	}
+}
+
+// A pulled list the kernel rejects is rolled back; its ETag must go too, or
+// later pulls answer 304 and the list is never retried.
+func TestPulledUsersRejectedByKernelDropETag(t *testing.T) {
+	k := &fakeKernel{running: true, updateErr: errors.New("update failed"), startErr: errors.New("start failed")}
+	src := newBlockingPollSource()
+	s := newPollingTestService(k, src)
+	before := []model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 2, UUID: "u2"}}
+	s.updateUserState(before)
+
+	pulled := []model.UserSpec{{ID: 1, UUID: "u1"}}
+	s.applyPullResult(context.Background(), pullResult{users: pulled, userHash: computeUserHash(pulled), userEventSeq: s.userEventSeq.Load()})
+
+	if got := usersByID(s.lastUsers); !mapsEqual(got, usersByID(before)) {
+		t.Fatalf("users = %v, want the old users restored", got)
+	}
+	if src.invalidations.Load() != 1 || s.stalePullDiscards != 1 {
+		t.Fatalf("invalidations = %d, stale discards = %d, want 1, 1", src.invalidations.Load(), s.stalePullDiscards)
+	}
+}
+
+// A pull carrying a config change and an empty user list stops the kernel;
+// the users must be revoked before, since Stop drains gracefully (a stopped
+// xray instance keeps serving its links for minutes).
+func TestPullClearingUsersWithConfigChangeRevokesBeforeStop(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		config  *model.NodeSpec
+		renewal bool
+	}{
+		{name: "config-change", config: &model.NodeSpec{Protocol: "vless", ServerPort: 9443}},
+		{name: "cert-renewal", renewal: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			k := &fakeKernel{running: true}
+			src := newBlockingPollSource()
+			s := newPollingTestService(k, src)
+			s.updateUserState([]model.UserSpec{{ID: 1, UUID: "u1"}})
+			if tc.renewal {
+				pendingCertRenewal(s)
+			}
+			var revoked []model.UserSpec
+			k.onUpdateUsers = func(users []model.UserSpec) {
+				if !k.running {
+					t.Fatal("users were revoked after the kernel stopped")
+				}
+				revoked = users
+			}
+
+			result := pullResult{users: []model.UserSpec{}, userHash: computeUserHash([]model.UserSpec{}), userEventSeq: s.userEventSeq.Load()}
+			if tc.config != nil {
+				result.config = tc.config
+				result.configHash = computeConfigHash(tc.config)
+			}
+			s.applyPullResult(context.Background(), result)
+
+			if k.updateCalls != 1 || revoked == nil || len(revoked) != 0 {
+				t.Fatalf("UpdateUsers calls = %d with %#v, want one call with an empty list", k.updateCalls, revoked)
+			}
+			if k.running {
+				t.Fatal("the kernel must be stopped")
+			}
+		})
+	}
+}
+
+// A pull that overlaps pushed events for other users still applies what it
+// read for everyone else: a user whose removal push was lost is removed by
+// that pull, however busy the node is. Before, any event during the pull
+// discarded the whole list, so steady traffic of unrelated events could keep
+// the removed user online indefinitely.
+func TestPullAppliesUsersUntouchedByConcurrentEvents(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		pulled     []model.UserSpec
+		wantRepull bool
+	}{
+		// The pull read the panel before the add of user 4: it conflicts on
+		// user 4 only, which keeps its pushed state.
+		{name: "read-before-event", pulled: []model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 3, UUID: "u3"}}, wantRepull: true},
+		// The pull read the panel after it: nothing conflicts.
+		{name: "read-after-event", pulled: []model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 3, UUID: "u3"}, {ID: 4, UUID: "u4"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			k := &fakeKernel{running: true}
+			src := newBlockingPollSource()
+			s := newPollingTestService(k, src)
+			// User 2 was removed on the panel; its push was lost.
+			s.updateUserState([]model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 2, UUID: "u2"}, {ID: 3, UUID: "u3"}})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			s.pullViaAPIAsync(ctx)
+			src.waitPoll(t)
+			s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncUserDelta, DeltaAction: "add", DeltaUsers: []model.UserSpec{{ID: 4, UUID: "u4"}}})
+			src.reply(t, pollReply{snapshot: controlplane.Snapshot{Users: tc.pulled}})
+			result := receivePullResult(t, s)
+			waitPullIdle(t, s)
+			var kernelUsers []model.UserSpec
+			k.onUpdateUsers = func(users []model.UserSpec) { kernelUsers = users }
+			invalidations := src.invalidations.Load()
+			s.applyPullResult(ctx, result)
+
+			want := map[int]string{1: "u1", 3: "u3", 4: "u4"}
+			if got := usersByID(s.lastUsers); !mapsEqual(got, want) {
+				t.Fatalf("users = %v, want %v", got, want)
+			}
+			if got := usersByID(kernelUsers); !mapsEqual(got, want) {
+				t.Fatalf("kernel users = %v, want %v", got, want)
+			}
+			if tc.wantRepull {
+				if src.invalidations.Load() <= invalidations || s.stalePullDiscards != 1 {
+					t.Fatalf("invalidations %d -> %d, stale discards %d: a conflict must drop the ETag and re-pull",
+						invalidations, src.invalidations.Load(), s.stalePullDiscards)
+				}
+				src.waitPoll(t)
+			} else {
+				if src.invalidations.Load() != invalidations || s.stalePullDiscards != 0 {
+					t.Fatalf("invalidations %d -> %d, stale discards %d: an agreeing pull is not stale",
+						invalidations, src.invalidations.Load(), s.stalePullDiscards)
+				}
+				src.expectNoPoll(t)
+			}
+		})
+	}
+}
+
+// A pushed full list may predate or follow the pulled one; the pulled list
+// is only applied when it already matches.
+func TestPullOverlappingFullUserPushIsDropped(t *testing.T) {
+	k := &fakeKernel{running: true}
+	src := newBlockingPollSource()
+	s := newPollingTestService(k, src)
+	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "u1"}})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	seq := s.userEventSeq.Load()
+	s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncUsers, Users: []model.UserSpec{{ID: 2, UUID: "u2"}}})
+	pulled := []model.UserSpec{{ID: 1, UUID: "u1"}}
+	s.applyPullResult(ctx, pullResult{users: pulled, userHash: computeUserHash(pulled), userEventSeq: seq})
+	if got := usersByID(s.lastUsers); !mapsEqual(got, map[int]string{2: "u2"}) {
+		t.Fatalf("users = %v, want the pushed full list", got)
+	}
+	if s.stalePullDiscards != 1 {
+		t.Fatalf("stale discards = %d, want a re-pull", s.stalePullDiscards)
+	}
+}
+
+// A pull older than the retained marks treats every user as touched.
+func TestPullOlderThanRetainedMarksIsDropped(t *testing.T) {
+	k := &fakeKernel{running: true}
+	src := newBlockingPollSource()
+	s := newPollingTestService(k, src)
+	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "u1"}})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	for i := 0; i < maxUserEventMarks+1; i++ {
+		s.noteUserEvent([]int{100000 + i}, false)
+	}
+	if len(s.userEventMarks) != maxUserEventMarks || s.userEventMarksFloor != 1 {
+		t.Fatalf("marks = %d, floor = %d, want %d, 1", len(s.userEventMarks), s.userEventMarksFloor, maxUserEventMarks)
+	}
+	pulled := []model.UserSpec{{ID: 2, UUID: "u2"}}
+	s.applyPullResult(ctx, pullResult{users: pulled, userHash: computeUserHash(pulled), userEventSeq: 0})
+	if got := usersByID(s.lastUsers); !mapsEqual(got, map[int]string{1: "u1"}) {
+		t.Fatalf("users = %v, want the local list kept", got)
+	}
+}
+
+// A pushed sync.config equal to the running config still marks pulls in
+// flight: the panel may have briefly had another config (B) that the pull
+// read, and has reverted to the running one (A) since.
+func TestWSConfigEqualToRunningStillMarksPullStale(t *testing.T) {
+	k := &fakeKernel{running: true}
+	src := newBlockingPollSource()
+	s := newPollingTestService(k, src)
+	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "u1"}})
+	running := s.lastConfig
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s.pullViaAPIAsync(ctx)
+	src.waitPoll(t)
+	s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncConfig, Config: &model.NodeSpec{Protocol: "vless"}})
+	b := &model.NodeSpec{Protocol: "vless", ServerPort: 9443}
+	src.reply(t, pollReply{snapshot: controlplane.Snapshot{Config: b}})
+	result := receivePullResult(t, s)
+	waitPullIdle(t, s)
+	s.applyPullResult(ctx, result)
+
+	if s.lastConfig != running || s.lastConfigHash != computeConfigHash(running) {
+		t.Fatalf("config = %+v, want the running config kept", s.lastConfig)
+	}
+	if k.reloadCalls != 0 {
+		t.Fatalf("Reload calls = %d, want 0", k.reloadCalls)
+	}
+	src.waitPoll(t)
+}
+
+// Machine mode: a delta the mailbox received before the pull started is
+// older than the pulled list. Replaying it would remove user 1, whom the
+// panel restored afterwards (that push lost).
+func TestPullDoesNotReplayMailboxDeltaOlderThanThePull(t *testing.T) {
+	k := &fakeKernel{running: true}
+	src := newBlockingPollSource()
+	s := newPollingTestService(k, src)
+	users := []model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 2, UUID: "u2"}}
+	s.updateUserState(users)
+	s.machineMailbox = controlplane.NewNodeMailbox()
+	s.markMailboxReadyAndDrain(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s.machineMailbox.Apply(controlplane.Event{Type: controlplane.EventSyncUserDelta, DeltaAction: "remove", DeltaUsers: []model.UserSpec{{ID: 1}}})
+	s.pullViaAPIAsync(ctx)
+	src.waitPoll(t)
+	src.reply(t, pollReply{snapshot: controlplane.Snapshot{Users: users}})
+	result := receivePullResult(t, s)
+	waitPullIdle(t, s)
+	s.applyPullResult(ctx, result)
+	s.drainMachineMailbox(ctx)
+
+	if got := usersByID(s.lastUsers); !mapsEqual(got, usersByID(users)) {
+		t.Fatalf("users = %v, want the pulled list (1, 2)", got)
+	}
+	src.expectNoPoll(t)
 }
 
 // A pull result dropped because the service is stopping leaves no ETag for
