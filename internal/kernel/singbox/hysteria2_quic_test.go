@@ -118,12 +118,13 @@ func TestHysteria2QUICNativeAudit(t *testing.T) {
 			}
 
 			// The fork stores authenticated users as indices. Removing A and
-			// prepending C must not turn B's already authenticated session into C.
+			// prepending C must not turn B's already authenticated session into
+			// C. A removed user loses its live streams; B keeps all of its own.
 			if added, removed, err := server.UpdateUsers([]model.UserSpec{userC, userB}); err != nil || added != 1 || removed != 1 {
 				t.Fatalf("hot update = (%d, %d, %v), want (1, 1, nil)", added, removed, err)
 			}
 			hysteria2AssertSameInbound(t, manager, inbound, server, tracker)
-			hysteria2TCPEcho(t, oldA)
+			hysteria2AssertCut(t, oldA)
 			hysteria2TCPEcho(t, oldB)
 			hysteria2UDPEcho(t, oldUDP, udpTarget)
 			hysteria2AssertEvents(t, capture, want, tcpTarget, udpTarget)
@@ -181,6 +182,9 @@ func TestHysteria2QUICNativeAudit(t *testing.T) {
 			if _, _, err := server.UpdateUsers([]model.UserSpec{userC, userB}); err != nil {
 				t.Fatalf("reorder existing users: %v", err)
 			}
+			// B's streams from before the removal survived every update since.
+			hysteria2TCPEcho(t, oldB)
+			hysteria2UDPEcho(t, oldUDP, udpTarget)
 			hysteria2OpenTCP(t, server.ctx, clientB, tcpTarget)
 			hysteria2OpenUDP(t, server.ctx, clientB, udpTarget)
 			want = append(want, hysteria2WantEvent{43, userB.UUID, "tcp"}, hysteria2WantEvent{43, userB.UUID, "udp"})
@@ -307,7 +311,7 @@ func hysteria2LocalClient(t *testing.T, ctx context.Context, port int, password,
 	return client, dialer
 }
 
-func hysteria2OpenTCP(t *testing.T, ctx context.Context, client *quicHY2.Client, target singM.Socksaddr) net.Conn {
+func hysteria2OpenTCP(t *testing.T, ctx context.Context, client quicUserClient, target singM.Socksaddr) net.Conn {
 	t.Helper()
 	conn, err := client.DialConn(ctx, target)
 	if err != nil {
@@ -336,7 +340,23 @@ func hysteria2TCPEcho(t *testing.T, conn net.Conn) {
 	}
 }
 
-func hysteria2OpenUDP(t *testing.T, ctx context.Context, client *quicHY2.Client, target singM.Socksaddr) net.PacketConn {
+// hysteria2AssertCut fails unless the server closed conn: a read must end
+// with an error, not data and not a timeout (a stream still being served).
+func hysteria2AssertCut(t *testing.T, conn net.Conn) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	n, err := conn.Read(make([]byte, 64))
+	if n > 0 || err == nil {
+		t.Fatal("removed user's live stream still delivers data")
+	}
+	if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		t.Fatal("removed user's live stream was not cut")
+	}
+}
+
+func hysteria2OpenUDP(t *testing.T, ctx context.Context, client quicUserClient, target singM.Socksaddr) net.PacketConn {
 	t.Helper()
 	conn, err := client.ListenPacket(ctx)
 	if err != nil {

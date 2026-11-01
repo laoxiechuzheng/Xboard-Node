@@ -3,6 +3,7 @@ package singbox
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/audit"
@@ -30,10 +31,10 @@ func (c *hysteria2AuditCapture) snapshot() []audit.Event {
 
 type hysteria2TestPacketConn struct {
 	N.PacketConn
-	closed bool
+	closed atomic.Bool
 }
 
-func (c *hysteria2TestPacketConn) Close() error { c.closed = true; return nil }
+func (c *hysteria2TestPacketConn) Close() error { c.closed.Store(true); return nil }
 
 // These tests simulate router callbacks; the with_quic integration test sends
 // real authenticated HY2 traffic through the native inbound and router.
@@ -87,7 +88,7 @@ func TestConnTrackerHysteria2UnknownUsersCannotBecomeAnotherAccount(t *testing.T
 			if len(capture.snapshot()) != 0 || tracker.ActiveCount() != 0 {
 				t.Fatal("unidentified HY2 connection was attributed to an account")
 			}
-			if !tcp.closed || !udp.closed {
+			if !tcp.closed.Load() || !udp.closed.Load() {
 				t.Fatal("unidentified HY2 connection must fail closed")
 			}
 		})
@@ -102,16 +103,19 @@ func TestConnTrackerHysteria2MapSnapshotAndAccountReuse(t *testing.T) {
 	tracker.SetAuditSink(capture, 7, "hysteria2")
 	users["user-a"] = 43
 	metadata := adapter.InboundContext{InboundType: "hysteria2", User: "user-a", Source: singM.ParseSocksaddr("203.0.113.9:12345"), Destination: singM.ParseSocksaddr("example.org:443")}
-	old := tracker.RoutedConnection(context.Background(), &testConn{}, metadata, nil, nil)
+	oldBase := &testConn{}
+	old := tracker.RoutedConnection(context.Background(), oldBase, metadata, nil, nil)
 	defer old.Close()
 	if events := capture.snapshot(); len(events) != 1 || events[0].UserID != 42 {
 		t.Fatal("caller mutation changed the authentication snapshot")
 	}
 	tracker.SetUserMap(map[string]int{"user-b": 43})
+	// Removing user-a cuts its live connection (in the background).
+	waitClosed(t, "removed HY2 user's connection", oldBase.closed.Load)
 	tracker.SetUserMap(map[string]int{"user-a": 43, "user-b": 43})
 	newConn := &testConn{}
 	tracker.RoutedConnection(context.Background(), newConn, metadata, nil, nil)
-	if !newConn.closed || len(capture.snapshot()) != 1 {
+	if !newConn.closed.Load() || len(capture.snapshot()) != 1 {
 		t.Fatal("a retired UUID was reassigned to a different account")
 	}
 	if _, err := old.Write([]byte("old-session")); err != nil {

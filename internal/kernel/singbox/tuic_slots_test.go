@@ -50,7 +50,7 @@ func TestConnTrackerTUICUnknownUsersFailClosed(t *testing.T) {
 		tracker.RoutedConnection(context.Background(), tcp, metadata, nil, nil)
 		udp := &hysteria2TestPacketConn{}
 		tracker.RoutedPacketConnection(context.Background(), udp, metadata, nil, nil)
-		if !tcp.closed || !udp.closed || len(capture.snapshot()) != 0 {
+		if !tcp.closed.Load() || !udp.closed.Load() || len(capture.snapshot()) != 0 {
 			t.Fatalf("unknown TUIC user %q was served or audited", identity)
 		}
 	}

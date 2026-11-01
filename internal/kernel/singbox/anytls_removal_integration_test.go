@@ -3,6 +3,8 @@ package singbox
 import (
 	"context"
 	"crypto/tls"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -108,6 +110,30 @@ func anyTLSEcho(stream net.Conn, payload string) error {
 	return err
 }
 
+// anyTLSCut reports whether the server cut stream, without writing to it.
+//
+// sing-anytls v0.0.11 writes Stream.dieErr when the session's receive loop
+// closes the stream and reads it in Stream.Write without synchronization, so
+// a Write on a stream whose session dies concurrently is a data race inside
+// the library (it does not depend on why the session dies). Read is safe:
+// it returns once the receive loop closes the stream's pipe, which orders the
+// error. A stream that is still served times out instead.
+func anyTLSCut(stream net.Conn) error {
+	stream.SetReadDeadline(time.Now().Add(5 * time.Second))
+	defer stream.SetReadDeadline(time.Time{})
+	n, err := stream.Read(make([]byte, 16))
+	if n > 0 {
+		return errors.New("stream still delivers data")
+	}
+	if err == nil {
+		return errors.New("read returned neither data nor an error")
+	}
+	if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		return fmt.Errorf("stream is still served: %w", err)
+	}
+	return nil
+}
+
 func waitPeerClosed(t *testing.T, what string, conn *peerClosedConn) {
 	t.Helper()
 	select {
@@ -190,8 +216,8 @@ func TestAnyTLSRemovedUserLosesSessionAndStreams(t *testing.T) {
 		t.Fatalf("RemoveUsers = (%d, %v), want (1, nil)", n, err)
 	}
 	waitPeerClosed(t, "removed user", removedClient.firstConn(t))
-	if err := anyTLSEcho(removedStream, "a2"); err == nil {
-		t.Fatal("live stream of a removed user still works")
+	if err := anyTLSCut(removedStream); err != nil {
+		t.Fatalf("live stream of a removed user: %v", err)
 	}
 	if err := anyTLSEcho(keptStream, "b2"); err != nil {
 		t.Fatalf("kept user's live stream was disrupted: %v", err)
@@ -203,9 +229,11 @@ func TestAnyTLSRemovedUserLosesSessionAndStreams(t *testing.T) {
 	if _, _, err := instance.UpdateUsers([]model.UserSpec{kept, resetUser}); err != nil {
 		t.Fatalf("UpdateUsers: %v", err)
 	}
+	// Opening the stream sends its destination; the server refuses it on
+	// that alone, so the test never writes on the dying session.
 	stale := resetClient.open(t, echo.Addr())
-	if err := anyTLSEcho(stale, "c2"); err == nil {
-		t.Fatal("new stream on a session authenticated with the old UUID was served")
+	if err := anyTLSCut(stale); err != nil {
+		t.Fatalf("new stream on a session authenticated with the old UUID: %v", err)
 	}
 	waitPeerClosed(t, "old UUID", resetClient.firstConn(t))
 

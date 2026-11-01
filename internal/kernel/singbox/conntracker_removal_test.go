@@ -328,6 +328,45 @@ func TestConnTrackerMovedUUIDServesCurrentOwnerOutsideSlotInbounds(t *testing.T)
 	}
 }
 
+// HY2 and TUIC keep users in stable slots named by UUID (a retired slot keeps
+// the removed UUID as its name). Adding, removing or resetting other users
+// must never cut a remaining user's live connections there; the QUIC
+// integration test (with_quic) drives the same updates through real clients.
+func TestConnTrackerSlotInboundsKeepRemainingUsersConnections(t *testing.T) {
+	for _, inboundType := range []string{"hysteria2", "tuic"} {
+		tracker := NewConnTracker(0)
+		tracker.SetUserMap(map[string]int{"uuid-a": 1, "uuid-b": 2, "uuid-r": 3})
+		keptTCP, keptUDP := &closeFlagConn{}, &closeFlagPacketConn{}
+		removedTCP, resetTCP := &closeFlagConn{}, &closeFlagConn{}
+		tracker.RoutedConnection(context.Background(), keptTCP, removalMetadata(inboundType, "uuid-b"), nil, nil)
+		tracker.RoutedPacketConnection(context.Background(), keptUDP, removalMetadata(inboundType, "uuid-b"), nil, nil)
+		tracker.RoutedConnection(context.Background(), removedTCP, removalMetadata(inboundType, "uuid-a"), nil, nil)
+		tracker.RoutedConnection(context.Background(), resetTCP, removalMetadata(inboundType, "uuid-r"), nil, nil)
+
+		for _, step := range []struct {
+			name  string
+			users map[string]int
+		}{
+			{"add", map[string]int{"uuid-a": 1, "uuid-b": 2, "uuid-r": 3, "uuid-c": 4}},
+			{"same map", map[string]int{"uuid-a": 1, "uuid-b": 2, "uuid-r": 3, "uuid-c": 4}},
+			{"remove", map[string]int{"uuid-b": 2, "uuid-r": 3, "uuid-c": 4}},
+			{"reset", map[string]int{"uuid-b": 2, "uuid-r2": 3, "uuid-c": 4}},
+		} {
+			tracker.SetUserMap(step.users)
+			stayOpen(t, inboundType+" kept TCP after "+step.name, keptTCP.closed.Load)
+			stayOpen(t, inboundType+" kept UDP after "+step.name, keptUDP.closed.Load)
+		}
+		waitClosed(t, inboundType+" removed user's connection", removedTCP.closed.Load)
+		waitClosed(t, inboundType+" old UUID's connection", resetTCP.closed.Load)
+
+		next := &closeFlagConn{}
+		wrapped := tracker.RoutedConnection(context.Background(), next, removalMetadata(inboundType, "uuid-b"), nil, nil)
+		if tracked, ok := wrapped.(*trackedConn); !ok || next.closed.Load() || tracked.userID != 2 {
+			t.Fatalf("%s: a new stream of the remaining user was refused", inboundType)
+		}
+	}
+}
+
 // RoutedConnection racing a removal: whichever side wins, no connection of
 // the removed user may stay open, and the remaining user's must.
 func TestConnTrackerConcurrentRoutingAndRemoval(t *testing.T) {

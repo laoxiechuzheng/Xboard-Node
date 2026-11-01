@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -59,7 +60,7 @@ func TestConnTrackerIdleJanitorClosesStaleConn(t *testing.T) {
 	tr.usersMu.Unlock()
 
 	tr.closeIdleConns()
-	if !conn.closed {
+	if !conn.closed.Load() {
 		t.Error("stale idle connection was not closed")
 	}
 }
@@ -75,13 +76,15 @@ func TestConnTrackerIdleJanitorKeepsFreshConn(t *testing.T) {
 	tr.usersMu.Unlock()
 
 	tr.closeIdleConns()
-	if conn.closed {
+	if conn.closed.Load() {
 		t.Error("fresh connection should not be closed")
 	}
 }
 
 type testConn struct {
-	closed bool
+	// closed is atomic: removing a user closes its connections in the
+	// background, concurrently with the test.
+	closed atomic.Bool
 	reads  [][]byte
 	writes [][]byte
 }
@@ -102,7 +105,7 @@ func (c *testConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func (c *testConn) Close() error                     { c.closed = true; return nil }
+func (c *testConn) Close() error                     { c.closed.Store(true); return nil }
 func (c *testConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
 func (c *testConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
 func (c *testConn) SetDeadline(time.Time) error      { return nil }
@@ -179,7 +182,7 @@ func TestConnTrackerRoutedConnectionRejectsWhenDeviceLimitExceeded(t *testing.T)
 	if wrapped2 != second {
 		t.Fatal("expected rejected connection to be returned unwrapped")
 	}
-	if !second.closed {
+	if !second.closed.Load() {
 		t.Fatal("expected rejected connection to be closed")
 	}
 }
@@ -217,7 +220,7 @@ func TestConnTrackerCloseByIDClosesTrackedConnection(t *testing.T) {
 	if !tracker.CloseByID(tracked.connID) {
 		t.Fatal("CloseByID() = false, want true")
 	}
-	if !base.closed {
+	if !base.closed.Load() {
 		t.Fatal("expected underlying connection to be closed")
 	}
 }
