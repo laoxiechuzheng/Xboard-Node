@@ -119,7 +119,7 @@ func TestXrayRemovedUserConnectionsAreCut(t *testing.T) {
 		// Only the test permits loopback echo destinations.
 		CustomRoute: []map[string]any{{"type": "field", "ip": []string{"127.0.0.1/32"}, "outboundTag": "direct"}},
 	})
-	t.Cleanup(x.Stop)
+	t.Cleanup(func() { stopAndRecycle(t, x) })
 	removed := model.UserSpec{ID: 1, UUID: "11111111-1111-4111-8111-111111111111"}
 	kept := model.UserSpec{ID: 2, UUID: "22222222-2222-4222-8222-222222222222"}
 	reset := model.UserSpec{ID: 3, UUID: "33333333-3333-4333-8333-333333333333"}

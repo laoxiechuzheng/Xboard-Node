@@ -57,8 +57,33 @@ func newRemovalTestXray(t *testing.T) *Xray {
 		// Only the test permits loopback echo destinations.
 		CustomRoute: []map[string]any{{"type": "field", "ip": []string{"127.0.0.1/32"}, "outboundTag": "direct"}},
 	})
-	t.Cleanup(x.Stop)
+	t.Cleanup(func() { stopAndRecycle(t, x) })
 	return x
+}
+
+// stopAndRecycle stops x without leaving an instance draining into later
+// tests: a link the inbound never sees end (SS2022's bridge until its idle
+// timeout) would keep the stopped instance and its listener alive, and the
+// shared REALITY tests count every listener of the process. Revoking all
+// users first ends every link, so the stopped instances close at once.
+func stopAndRecycle(t *testing.T, x *Xray) {
+	t.Helper()
+	x.updateDispatcherLimits(nil)
+	x.Stop()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		x.mu.Lock()
+		draining := len(x.drainingLDs)
+		x.mu.Unlock()
+		if draining == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("%d stopped xray instances still draining", draining)
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func vlessNode(port int) *model.NodeSpec {
